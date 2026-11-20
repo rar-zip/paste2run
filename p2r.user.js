@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Paste2Run
 // @namespace    https://local.p2r
-// @version      0.3.0
+// @version      0.3.1
 // @updateURL    __P2R_ENDPOINT__/p2r.user.js
 // @downloadURL  __P2R_ENDPOINT__/p2r.user.js
 // @description  网页 AI 回复完成后，自动把 ===FILE:=== 段落落地成本地项目文件
@@ -38,7 +38,6 @@
   const set = (k, v) => localStorage.setItem(k, v);
   const autoOn = () => get(LS.auto, "1") === "1";
   const dryOn = () => get(LS.dry, "0") === "1";
-  const runOn = () => get(LS.run, "0") === "1";
 
   // 各站点助手消息选择器，按优先级尝试
   const SELECTORS = [
@@ -60,22 +59,23 @@
     return null;
   }
 
-  function toast(text, ms = 2600) {
+  function toast(text, ms = 2800) {
     let el = document.getElementById("p2r-toast");
     if (!el) {
       el = document.createElement("div");
       el.id = "p2r-toast";
       el.style.cssText = [
         "position:fixed", "right:18px", "bottom:18px", "z-index:2147483647",
-        "max-width:360px", "padding:11px 15px", "border-radius:10px",
-        "background:#111", "color:#f5efe4", "font:13px/1.5 -apple-system,sans-serif",
-        "box-shadow:0 8px 30px rgba(0,0,0,.35)", "white-space:pre-wrap",
-        "border:1px solid rgba(255,255,255,.15)", "opacity:0",
-        "transition:opacity .2s",
+        "max-width:380px", "padding:10px 14px", "border-radius:0",
+        "background:#070707", "color:#f2f2f2",
+        "font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace",
+        "box-shadow:4px 4px 0 rgba(255,255,255,.15)", "white-space:pre-wrap",
+        "border:1px solid #f2f2f2", "opacity:0",
+        "transition:opacity .15s ease",
       ].join(";");
       document.body.appendChild(el);
     }
-    el.textContent = text;
+    el.textContent = "> " + text;
     el.style.opacity = "1";
     clearTimeout(el._t);
     el._t = setTimeout(() => (el.style.opacity = "0"), ms);
@@ -128,51 +128,59 @@
     const h = hash(text);
     if (!opts.force && get(LS.lastHash) === h) return;
 
-    const target = get(LS.target, "");
-    if (!target) {
-      toast("先打开设置页配好目标目录（油猴菜单 → 打开设置页）");
+    // 实时同步服务端最新 target 与 allow_run，避免多标签页配置漂移
+    const info = await ping();
+    if (!info) {
+      toast("连不上本地服务，请确认 Paste2Run 正在运行");
       return;
     }
+    if (info.target) set(LS.target, info.target);
+    const serverAllowRun = !!info.allow_run;
+    set(LS.run, serverAllowRun ? "1" : "0");
 
     set(LS.lastHash, h);
-    toast("正在落地…");
+    toast("[P2R] APPLYING…");
     try {
-      const res = await post("/apply", { text, target, dryRun: dryOn() });
+      const res = await post("/apply", {
+        text,
+        dryRun: dryOn(),
+        source: location.hostname,
+      });
       if (res.ok) {
-        const list = (res.files || []).map((f) => "· " + f.path).slice(0, 6).join("\n");
-        const more = (res.files || []).length > 6 ? `\n…共 ${res.files.length} 个文件` : "";
-        toast(`已写入 ${res.files.length} 个文件${dryOn() ? "（试运行）" : ""}\n${list}${more}`, 4200);
+        const list = (res.files || []).map((f) => "  + " + f.path).slice(0, 6).join("\n");
+        const more = (res.files || []).length > 6 ? `\n  …共 ${res.files.length} 个文件` : "";
+        const skipNote = (res.skipped || []).length ? `\n  ! 跳过 ${res.skipped.length} 个越界/受保护路径` : "";
+        toast(`WRITTEN ${res.files.length} FILE(S)${dryOn() ? " [DRY-RUN]" : ""}\n${list}${more}${skipNote}`, 4200);
         if (GM_notification) {
           GM_notification({ text: `Paste2Run 写入 ${res.files.length} 个文件`, timeout: 3000 });
         }
-        if (!dryOn() && runOn() && res.run) {
-          toast("已写入，正在启动，可能要一会儿…", 4000);
-          post("/run", { target }, 300000)
+        if (!dryOn() && serverAllowRun && res.run) {
+          toast("[P2R] EXEC ===RUN===…", 4000);
+          post("/run", {}, 300000)
             .then(async (r) => {
               if (r.ok) {
-                toast(`启动成功（${r.duration}s）`);
+                toast(`[P2R] RUN OK (${r.duration}s)`);
               } else if (r.error) {
-                toast("启动失败：" + r.error, 4200);
+                toast("[P2R] RUN BLOCKED: " + r.error, 4200);
               } else {
-                const rep = await post("/repair", { target, output: r.output || "" });
+                const rep = await post("/repair", { output: r.output || "" });
                 GM_setClipboard(rep.prompt || "", "text");
                 const first = (r.output || "").split("\n").filter(Boolean).slice(-1)[0] || "";
-                toast("启动失败，修复提示词已复制\n粘回对话框即可\n" + first.slice(0, 120), 6000);
+                toast("[P2R] RUN FAILED -> 修复提示词已复制\n" + first.slice(0, 120), 6000);
               }
             })
-            .catch((e) => toast("启动请求失败：" + e.message, 4200));
+            .catch((e) => toast("[P2R] RUN ERROR: " + e.message, 4200));
         }
       } else if (res.error && res.error.indexOf("X-P2R-Token") >= 0) {
-        toast("脚本和本地服务对不上了\n打开 " + ENDPOINT + " 重新点一次「安装脚本」", 6000);
+        toast("TOKEN 不匹配，请打开 " + ENDPOINT + " 重新安装脚本", 6000);
       } else {
-        toast("落地失败：" + (res.error || "未知错误"));
+        toast("APPLY FAILED: " + (res.error || "未知错误"));
       }
     } catch (e) {
-      toast(e.message + "，确认 Paste2Run 本地服务在跑（双击 start 脚本）");
+      toast(e.message + "，确认 Paste2Run 本地服务在跑");
     }
   }
 
-  // 观测：内容停止变化 1.4 秒后视为生成完成
   let timer = null;
   let lastText = "";
 
@@ -193,7 +201,6 @@
     mo.observe(document.body, { childList: true, subtree: true, characterData: true });
   }
 
-  // 菜单
   GM_registerMenuCommand("打开设置页", () => {
     if (GM_openInTab) GM_openInTab(ENDPOINT + "/", { active: true });
     else window.open(ENDPOINT + "/", "_blank");
@@ -205,28 +212,29 @@
     if (!dir) return;
     try {
       const r = await post("/config", { target: dir });
-      if (r.ok) { set(LS.target, r.target); toast("目标目录已设为\n" + r.target); }
+      if (r.ok) { set(LS.target, r.target); toast("TARGET SET:\n" + r.target); }
       else toast("设置失败：" + (r.error || ""));
     } catch (e) { toast(e.message); }
   });
 
-  GM_registerMenuCommand("切换自动落地（当前：开/关）", () => {
+  GM_registerMenuCommand("切换自动落地（开/关）", () => {
     const v = autoOn() ? "0" : "1";
     set(LS.auto, v);
-    toast(v === "1" ? "自动落地：开" : "自动落地：关");
+    toast(v === "1" ? "AUTO_APPLY: ON" : "AUTO_APPLY: OFF");
   });
 
   GM_registerMenuCommand("切换试运行（只解析不写盘）", () => {
     const v = dryOn() ? "0" : "1";
     set(LS.dry, v);
-    toast(v === "1" ? "试运行：开" : "试运行：关");
+    toast(v === "1" ? "DRY_RUN: ON" : "DRY_RUN: OFF");
   });
 
-  GM_registerMenuCommand("切换自动启动/修复（当前：关）", () => {
-    const v = runOn() ? "0" : "1";
-    set(LS.run, v);
-    post("/config", { allow_run: v === "1" }).catch(() => {});
-    toast(v === "1" ? "自动启动：开（会执行 ===RUN=== 里的命令）" : "自动启动：关");
+  GM_registerMenuCommand("切换自动执行 ===RUN===", async () => {
+    const info = await ping();
+    const next = !(info ? !!info.allow_run : get(LS.run, "0") === "1");
+    set(LS.run, next ? "1" : "0");
+    post("/config", { allow_run: next }).catch(() => {});
+    toast(next ? "AUTO_RUN: ON" : "AUTO_RUN: OFF");
   });
 
   GM_registerMenuCommand("手动落地最后一条回复", () => {
@@ -235,19 +243,21 @@
     applyNode(node, { force: true });
   });
 
-  // 左下角悬浮按钮，站点快捷键失效时兜底
+  // 左下角黑白极简 ASCII 悬浮按钮
   function mountButton() {
     const b = document.createElement("button");
-    b.textContent = "落地";
+    b.textContent = "[ P2R: APPLY ]";
     b.title = "Paste2Run：把最后一条回复写成文件";
     b.style.cssText = [
       "position:fixed", "left:16px", "bottom:16px", "z-index:2147483647",
-      "padding:8px 14px", "border-radius:999px", "border:1px solid rgba(255,255,255,.18)",
-      "background:#1b1b1b", "color:#f0c98a", "font:12px/1 -apple-system,sans-serif",
-      "cursor:pointer", "opacity:.55",
+      "padding:7px 12px", "border-radius:0", "border:1px solid #f2f2f2",
+      "background:#070707", "color:#f2f2f2",
+      "font:700 11px/1 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace",
+      "letter-spacing:.06em", "cursor:pointer", "opacity:.65",
+      "transition:opacity .15s,background .15s,color .15s",
     ].join(";");
-    b.onmouseenter = () => (b.style.opacity = "1");
-    b.onmouseleave = () => (b.style.opacity = ".55");
+    b.onmouseenter = () => { b.style.opacity = "1"; b.style.background = "#f2f2f2"; b.style.color = "#070707"; };
+    b.onmouseleave = () => { b.style.opacity = ".65"; b.style.background = "#070707"; b.style.color = "#f2f2f2"; };
     b.onclick = () => {
       const node = lastAssistantNode();
       if (!node) return toast("没找到助手消息");
@@ -259,8 +269,9 @@
   setTimeout(async () => {
     const info = await ping();
     if (info && info.target) set(LS.target, info.target);
+    if (info && typeof info.allow_run === "boolean") set(LS.run, info.allow_run ? "1" : "0");
     watch();
     mountButton();
-    if (!info) toast("Paste2Run：本地服务没连上\n先双击 start 脚本启动本地服务", 5000);
+    if (!info) toast("LOCAL SERVER OFFLINE\n先双击 start 脚本启动 Paste2Run", 5000);
   }, 1200);
 })();

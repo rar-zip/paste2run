@@ -21,6 +21,7 @@
 """
 import argparse
 import hmac
+import html
 import json
 import os
 import re
@@ -28,11 +29,12 @@ import secrets
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 HOME = os.path.expanduser("~/.p2r")
 CONFIG = os.path.join(HOME, "config.json")
 LOG = os.path.join(HOME, "p2r.log")
@@ -43,6 +45,8 @@ PORT_TRIES = 10
 
 FILE_RE = re.compile(r"^[ \t]*(?:\*\*)?===\s*FILE:\s*(.+?)\s*===\s*(?:\*\*)?[ \t]*$", re.M)
 RUN_RE = re.compile(r"^[ \t]*(?:\*\*)?===\s*RUN\s*===\s*(?:\*\*)?[ \t]*$", re.M)
+
+_CONFIG_LOCK = threading.Lock()
 
 
 def log(msg):
@@ -63,44 +67,64 @@ def default_config():
 
 
 def load_config():
-    """读配置；缺字段就补上并落盘，保证 token / 端口总是存在。"""
+    """读配置；仅在配置缺失或字段异常时补齐落盘，避免每次 HTTP 请求都写盘竞态。"""
     cfg = default_config()
-    if os.path.exists(CONFIG):
+    dirty = not os.path.exists(CONFIG)
+    if not dirty:
         try:
             with open(CONFIG, encoding="utf-8") as fh:
-                cfg.update(json.load(fh) or {})
+                loaded = json.load(fh)
+            if isinstance(loaded, dict):
+                for key in ("target", "token", "port"):
+                    if not loaded.get(key):
+                        dirty = True
+                cfg.update(loaded)
+            else:
+                dirty = True
         except Exception:
-            pass
+            dirty = True
     if not cfg.get("target"):
         cfg["target"] = DEFAULT_TARGET
+        dirty = True
     if not cfg.get("token"):
         cfg["token"] = secrets.token_hex(16)
+        dirty = True
     try:
         cfg["port"] = int(cfg.get("port") or DEFAULT_PORT)
     except (TypeError, ValueError):
         cfg["port"] = DEFAULT_PORT
-    save_config(cfg)
+        dirty = True
+    if dirty:
+        save_config(cfg)
     return cfg
 
 
 def save_config(cfg):
-    os.makedirs(HOME, exist_ok=True)
-    tmp = CONFIG + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(cfg, fh, ensure_ascii=False, indent=2)
-    os.replace(tmp, CONFIG)
-    try:
-        os.chmod(CONFIG, 0o600)
-    except OSError:
-        pass
+    with _CONFIG_LOCK:
+        os.makedirs(HOME, exist_ok=True)
+        tmp = "%s.%d.%d.tmp" % (CONFIG, os.getpid(), threading.get_ident())
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(cfg, fh, ensure_ascii=False, indent=2)
+        os.replace(tmp, CONFIG)
+        try:
+            os.chmod(CONFIG, 0o600)
+        except OSError:
+            pass
 
 
 def strip_fences(body):
-    """去掉 AI 习惯性包在代码块外面的 ```lang 和结尾 ```。"""
-    lines = body.strip("\n").splitlines()
+    """去掉 AI 习惯性包在代码块外面的 ```lang 和结尾 ```，并截断结尾围栏之后的闲聊结语。"""
+    lines = (body or "").strip("\n").splitlines()
     if lines and lines[0].strip().startswith("```"):
         lines = lines[1:]
-    if lines and lines[-1].strip() == "```":
+        close_idx = None
+        for idx in range(len(lines) - 1, -1, -1):
+            if lines[idx].strip() == "```":
+                close_idx = idx
+                break
+        if close_idx is not None:
+            lines = lines[:close_idx]
+    elif lines and lines[-1].strip() == "```":
         lines = lines[:-1]
     return "\n".join(lines) + "\n"
 
@@ -108,42 +132,48 @@ def strip_fences(body):
 def parse(text):
     """返回 (files: [(path, content)], run_commands: str)"""
     text = (text or "").replace("\ufeff", "").replace("\r\n", "\n")
-    matches = list(FILE_RE.finditer(text))
-    if not matches:
+    markers = []
+    for mt in FILE_RE.finditer(text):
+        markers.append(("file", mt.start(), mt.end(), mt.group(1).strip().strip("`\"'")))
+    for mt in RUN_RE.finditer(text):
+        markers.append(("run", mt.start(), mt.end(), ""))
+    if not markers:
         return [], ""
 
-    run_at = None
-    m = RUN_RE.search(text)
-    if m:
-        run_at = m.start()
-
+    markers.sort(key=lambda item: item[1])
     files = []
-    for i, mt in enumerate(matches):
-        path = mt.group(1).strip().strip("`\"'")
-        start = mt.end()
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
-        if run_at is not None and run_at > start and (i + 1 >= len(matches) or matches[i + 1].start() > run_at):
-            end = run_at
-        files.append((path, strip_fences(text[start:end])))
+    run_parts = []
+    for i, (kind, _start, end_pos, label) in enumerate(markers):
+        next_start = markers[i + 1][1] if i + 1 < len(markers) else len(text)
+        chunk = text[end_pos:next_start]
+        if kind == "file":
+            files.append((label, strip_fences(chunk)))
+        else:
+            cmd = strip_fences(chunk).strip()
+            if cmd:
+                run_parts.append(cmd)
+    return files, "\n".join(run_parts).strip()
 
-    run_cmds = ""
-    if run_at is not None:
-        tail = text[run_at:]
-        run_cmds = RUN_RE.sub("", tail).strip()
-        run_cmds = strip_fences(run_cmds).strip()
-    return files, run_cmds
+
+PROTECTED_TOP_DIRS = {".git", ".p2r"}
 
 
 def safe_target(root, rel):
-    """把模型给的相对路径限制在 root 内，拒绝绝对路径和 ..。"""
-    rel = (rel or "").replace("\\", "/").lstrip("/")
-    while rel.startswith("./"):
-        rel = rel[2:]
-    if not rel or rel in (".", "..") or "\0" in rel:
-        raise ValueError("非法路径: %r" % rel)
-    if rel.startswith("~") or re.match(r"^[a-zA-Z]:", rel):
+    """把模型给的相对路径限制在 root 内，拒绝绝对路径、.. 以及 .git/.p2r 受保护目录。"""
+    raw = (rel or "").replace("\\", "/")
+    if raw.startswith("/") or raw.startswith("~") or re.match(r"^[a-zA-Z]:", raw):
         raise ValueError("拒绝绝对路径: %s" % rel)
-    full = os.path.realpath(os.path.join(root, rel))
+    cleaned = raw
+    while cleaned.startswith("./"):
+        cleaned = cleaned[2:]
+    if not cleaned or cleaned in (".", "..") or "\0" in cleaned:
+        raise ValueError("非法路径: %r" % rel)
+    parts = [p for p in cleaned.split("/") if p]
+    if not parts or any(p in (".", "..") for p in parts):
+        raise ValueError("路径越界: %s" % rel)
+    if parts[0] in PROTECTED_TOP_DIRS:
+        raise ValueError("拒绝写入受保护目录: %s" % rel)
+    full = os.path.realpath(os.path.join(root, cleaned))
     root_real = os.path.realpath(root)
     if not (full == root_real or full.startswith(root_real + os.sep)):
         raise ValueError("路径越界: %s" % rel)
@@ -201,7 +231,7 @@ MAX_TAIL = 4000
 
 
 def project_tree(root, max_entries=80, max_depth=2):
-    """给修复 prompt 用的轻量目录树。"""
+    """给修复 prompt 和前端展示用的轻量 ASCII 目录树。"""
     lines = []
 
     def walk(base, prefix, depth):
@@ -212,13 +242,17 @@ def project_tree(root, max_entries=80, max_depth=2):
         except OSError:
             return
         entries = [e for e in entries if e not in SKIP_DIRS and not e.startswith(".DS_Store")]
-        for name in entries:
+        entries.sort(key=lambda e: (not os.path.isdir(os.path.join(base, e)), e.lower()))
+        for idx, name in enumerate(entries):
             if len(lines) >= max_entries:
                 return
             full = os.path.join(base, name)
-            lines.append(prefix + name + ("/" if os.path.isdir(full) else ""))
-            if os.path.isdir(full):
-                walk(full, prefix + "  ", depth + 1)
+            is_last = idx == len(entries) - 1
+            branch = "└── " if is_last else "├── "
+            is_dir = os.path.isdir(full)
+            lines.append(prefix + branch + name + ("/" if is_dir else ""))
+            if is_dir:
+                walk(full, prefix + ("    " if is_last else "│   "), depth + 1)
 
     walk(root, "", 0)
     if len(lines) >= max_entries:
@@ -226,8 +260,17 @@ def project_tree(root, max_entries=80, max_depth=2):
     return "\n".join(lines)
 
 
-BLOCKED_CMDS = ("sudo ", "rm -rf /", "rm -fr /", "mkfs", "diskutil erase", "format c:",
-                ":(){", "shutdown ", "reboot ", "del /f /s /q c:\\")
+BLOCKED_PATTERNS = (
+    re.compile(r"\bsudo\b"),
+    re.compile(r"\brm\s+-[a-z]*r[a-z]*f[a-z]*\s+/(\s|$)"),
+    re.compile(r"\brm\s+-[a-z]*f[a-z]*r[a-z]*\s+/(\s|$)"),
+    re.compile(r"\bmkfs\b"),
+    re.compile(r"\bdiskutil\s+erase\b"),
+    re.compile(r"\bformat\s+c:"),
+    re.compile(r":\(\)\s*\{"),
+    re.compile(r"\b(shutdown|reboot)\b"),
+    re.compile(r"\bdel\s+/[a-z\s]*c:\\"),
+)
 
 
 def run_in(root, commands, timeout=300):
@@ -235,9 +278,10 @@ def run_in(root, commands, timeout=300):
     if not commands or not commands.strip():
         return {"ok": False, "error": "没有可执行的命令", "code": None, "output": ""}
     lowered = commands.lower()
-    for bad in BLOCKED_CMDS:
-        if bad in lowered:
-            return {"ok": False, "error": "命令里包含危险操作，已拒绝: %s" % bad, "code": None, "output": ""}
+    for pat in BLOCKED_PATTERNS:
+        m = pat.search(lowered)
+        if m:
+            return {"ok": False, "error": "命令里包含危险操作，已拒绝: %s" % m.group(0), "code": None, "output": ""}
     started = time.time()
     try:
         proc = subprocess.run(
@@ -270,128 +314,613 @@ def repair_prompt(root, output, original_mood=""):
     )
 
 
-# ---- 引导页 ----
+def parse_host_header(header_val):
+    """正确提取 Host 头中的主机名（兼容 IPv4、hostname 与带端口的 IPv6 [::1]:18765）。"""
+    h = (header_val or "").strip().lower()
+    if h.startswith("["):
+        end = h.find("]")
+        return h[:end + 1] if end != -1 else h
+    return h.split(":", 1)[0]
+
+
+# ---- 黑白极简 ASCII 控制台 ----
 SETUP_HTML = r"""<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Paste2Run</title>
+<title>PASTE2RUN // ASCII CONTROL CONSOLE</title>
 <style>
-*{box-sizing:border-box}
-body{margin:0;padding:24px 16px 44px;background:#0e1116;color:#e6edf3;font:15px/1.75 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif}
-.wrap{max-width:640px;margin:0 auto}
-h1{font-size:22px;margin:0 0 2px}
-h1 small{font-size:12px;color:#8b949e;font-weight:400;margin-left:6px}
-.sub{color:#8b949e;font-size:13px;margin-bottom:20px}
-.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#8b949e;margin-right:6px;vertical-align:2px}
-.card{background:#161b22;border:1px solid #21262d;border-radius:10px;padding:15px 15px 17px;margin-bottom:13px}
-.card h2{font-size:15px;margin:0 0 11px}
-.card h2 span{color:#8b949e;font-weight:400;margin-right:7px}
-.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
-input[type=text]{flex:1;min-width:190px;padding:9px 11px;border-radius:7px;border:1px solid #30363d;background:#0d1117;color:#e6edf3;font-size:14px;font-family:inherit}
-button,.btn{display:inline-block;padding:9px 14px;border-radius:7px;border:1px solid #30363d;background:#21262d;color:#e6edf3;font-size:14px;font-family:inherit;cursor:pointer;text-decoration:none}
-button.primary,.btn.primary{background:#238636;border-color:#2ea043;color:#fff;font-weight:500}
-button:hover{background:#30363d}
-button.primary:hover{background:#2ea043}
-label.ck{display:flex;gap:7px;align-items:center;color:#8b949e;font-size:13.5px;cursor:pointer;margin-top:11px}
-.tip{color:#8b949e;font-size:12.5px;margin-top:9px}
-pre{background:#0d1117;border:1px solid #21262d;border-radius:7px;padding:11px;overflow:auto;font-size:12.5px;line-height:1.55;margin:11px 0 0;color:#9fb3c8;white-space:pre-wrap;word-break:break-all}
-#msg{font-size:13px;color:#3fb950;min-height:20px;margin-top:6px}
-.muted{color:#8b949e}
-.sticky{position:fixed;left:0;right:0;bottom:0;padding:10px 16px;background:#0e1116f2;border-top:1px solid #21262d;font-size:13px;color:#8b949e;text-align:center}
+:root {
+  --bg: #070707;
+  --surface: #0d0d0d;
+  --surface-2: #141414;
+  --fg: #f2f2f2;
+  --fg-dim: #8a8a8a;
+  --fg-faint: #4a4a4a;
+  --border: #2a2a2a;
+  --border-hi: #f2f2f2;
+  --inv-bg: #f2f2f2;
+  --inv-fg: #070707;
+  --dot: rgba(255,255,255,0.055);
+  --mono: "JetBrains Mono","Fira Code","SF Mono","Cascadia Code",ui-monospace,Menlo,Consolas,"PingFang SC","Noto Sans Mono CJK SC",monospace;
+}
+html[data-theme="light"] {
+  --bg: #f5f5f3;
+  --surface: #ffffff;
+  --surface-2: #ecece8;
+  --fg: #0a0a0a;
+  --fg-dim: #5c5c5c;
+  --fg-faint: #9e9e9e;
+  --border: #c8c8c4;
+  --border-hi: #0a0a0a;
+  --inv-bg: #0a0a0a;
+  --inv-fg: #f5f5f3;
+  --dot: rgba(0,0,0,0.06);
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  background-color: var(--bg);
+  background-image: radial-gradient(var(--dot) 1px, transparent 1px);
+  background-size: 16px 16px;
+  color: var(--fg);
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1.65;
+  padding: 20px 16px 64px;
+  -webkit-font-smoothing: antialiased;
+  transition: background-color 0.15s ease, color 0.15s ease;
+}
+.shell { max-width: 1120px; margin: 0 auto; }
+.topbar {
+  display: flex; justify-content: space-between; align-items: center;
+  flex-wrap: wrap; gap: 10px; padding-bottom: 12px; margin-bottom: 16px;
+  border-bottom: 1px solid var(--border); font-size: 12px; letter-spacing: 0.04em;
+}
+.topbar-left, .topbar-right { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
+.badge {
+  display: inline-flex; align-items: center; gap: 6px; padding: 2px 8px;
+  border: 1px solid var(--border); background: var(--surface);
+  font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em;
+}
+.badge.solid { background: var(--inv-bg); color: var(--inv-fg); border-color: var(--inv-bg); font-weight: 700; }
+.pulse { display: inline-block; width: 7px; height: 7px; background: var(--fg); animation: blink 1.4s steps(2, start) infinite; }
+.pulse.off { background: transparent; border: 1px solid var(--fg-dim); animation: none; }
+@keyframes blink { 0%, 49% { opacity: 1; } 50%, 100% { opacity: 0.2; } }
+
+.hero { border: 1px solid var(--border); background: var(--surface); padding: 18px 20px 16px; margin-bottom: 16px; }
+.hero-grid { display: flex; justify-content: space-between; align-items: flex-end; gap: 20px; flex-wrap: wrap; }
+.ascii-logo {
+  margin: 0; font-size: clamp(7.5px, 1.35vw, 11.5px); line-height: 1.18;
+  letter-spacing: 0.02em; color: var(--fg); overflow-x: auto; white-space: pre; user-select: none;
+}
+.hero-meta { flex: 1; min-width: 240px; display: flex; flex-direction: column; gap: 8px; align-items: flex-end; text-align: right; }
+.hero-tagline { font-size: 12px; color: var(--fg-dim); letter-spacing: 0.03em; }
+.pipeline {
+  margin-top: 14px; padding-top: 12px; border-top: 1px dashed var(--border);
+  font-size: 11.5px; color: var(--fg-dim); display: flex; align-items: center;
+  justify-content: space-between; flex-wrap: wrap; gap: 8px;
+}
+.pipe-flow { white-space: pre; overflow-x: auto; color: var(--fg); }
+.pipe-flow span { color: var(--fg-dim); }
+.cursor { display: inline-block; width: 7px; height: 13px; background: var(--fg); vertical-align: -2px; margin-left: 4px; animation: blink 1s steps(2, start) infinite; }
+
+.grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.15fr); gap: 16px; align-items: start; }
+@media (max-width: 860px) {
+  .grid { grid-template-columns: 1fr; }
+  .hero-meta { align-items: flex-start; text-align: left; }
+}
+.col { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+.panel { border: 1px solid var(--border); background: var(--surface); min-width: 0; }
+.panel-head {
+  display: flex; justify-content: space-between; align-items: center; gap: 10px;
+  padding: 9px 14px; border-bottom: 1px solid var(--border); background: var(--surface-2);
+  font-size: 11.5px; letter-spacing: 0.08em; text-transform: uppercase;
+}
+.panel-title { font-weight: 700; color: var(--fg); }
+.panel-title .idx { color: var(--fg-dim); font-weight: 400; margin-right: 6px; }
+.panel-body { padding: 14px; }
+.row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+
+input[type="text"], textarea {
+  width: 100%; background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+  padding: 8px 10px; font-family: var(--mono); font-size: 12.5px; line-height: 1.5;
+  outline: none; border-radius: 0; transition: border-color 0.12s ease;
+}
+input[type="text"] { flex: 1; min-width: 180px; }
+input[type="text"]:focus, textarea:focus { border-color: var(--border-hi); }
+textarea { min-height: 148px; resize: vertical; tab-size: 2; }
+
+button, .btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  padding: 7px 12px; border: 1px solid var(--border); background: var(--surface);
+  color: var(--fg); font-family: var(--mono); font-size: 12px; letter-spacing: 0.04em;
+  text-decoration: none; cursor: pointer; border-radius: 0; white-space: nowrap;
+  transition: background-color 0.1s ease, color 0.1s ease, border-color 0.1s ease;
+}
+button:hover, .btn:hover { border-color: var(--border-hi); background: var(--inv-bg); color: var(--inv-fg); }
+button:disabled { opacity: 0.4; cursor: not-allowed; }
+button.primary, .btn.primary { background: var(--inv-bg); color: var(--inv-fg); border-color: var(--inv-bg); font-weight: 700; }
+button.primary:hover, .btn.primary:hover { background: var(--bg); color: var(--fg); border-color: var(--border-hi); }
+button.sm { padding: 3px 8px; font-size: 11px; }
+button.tab { border-color: transparent; background: transparent; color: var(--fg-dim); padding: 3px 8px; font-size: 11px; }
+button.tab.active { border-color: var(--border-hi); background: var(--inv-bg); color: var(--inv-fg); font-weight: 700; }
+
+.toggle-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  margin-top: 12px; padding: 8px 10px; border: 1px dashed var(--border);
+  background: var(--bg); cursor: pointer; user-select: none;
+}
+.toggle-row:hover { border-color: var(--fg-dim); }
+.toggle-label { display: flex; align-items: center; gap: 8px; font-size: 12.5px; }
+.ascii-ck { font-weight: 700; }
+.hint { color: var(--fg-dim); font-size: 11.5px; margin-top: 9px; line-height: 1.6; }
+.sites-bar {
+  margin-top: 10px; padding-top: 10px; border-top: 1px dashed var(--border);
+  font-size: 11px; color: var(--fg-dim); display: flex; flex-wrap: wrap; gap: 6px;
+}
+.site-tag { border: 1px solid var(--border); padding: 1px 6px; color: var(--fg); }
+
+pre.box {
+  background: var(--bg); border: 1px solid var(--border); padding: 11px 12px;
+  margin: 10px 0 0; font-family: var(--mono); font-size: 12px; line-height: 1.55;
+  color: var(--fg); white-space: pre-wrap; word-break: break-word;
+  overflow-x: auto; max-height: 260px; overflow-y: auto;
+}
+pre.tree-box { white-space: pre; word-break: normal; max-height: 220px; }
+
+.sec-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; margin-top: 10px; font-size: 11px; }
+.sec-item { border: 1px solid var(--border); padding: 5px 8px; display: flex; justify-content: space-between; gap: 6px; background: var(--bg); }
+.sec-item .k { color: var(--fg-dim); }
+.sec-item .v { color: var(--fg); font-weight: 700; }
+
+.manifest-table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 12px; }
+.manifest-table th, .manifest-table td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--border); }
+.manifest-table th { color: var(--fg-dim); font-weight: 400; font-size: 11px; text-transform: uppercase; border-bottom: 1px solid var(--fg-dim); }
+.manifest-table td.num, .manifest-table th.num { text-align: right; white-space: nowrap; }
+.run-box { margin-top: 12px; padding: 10px; border: 1px solid var(--border); background: var(--bg); }
+.run-cmd { font-weight: 700; word-break: break-all; }
+
+.toast {
+  position: fixed; right: 18px; bottom: 48px; z-index: 999;
+  border: 1px solid var(--border-hi); background: var(--inv-bg); color: var(--inv-fg);
+  padding: 8px 14px; font-size: 12px; font-weight: 700; letter-spacing: 0.03em;
+  opacity: 0; transform: translateY(6px); pointer-events: none;
+  transition: opacity 0.15s ease, transform 0.15s ease;
+  max-width: min(420px, calc(100vw - 36px));
+}
+.toast.show { opacity: 1; transform: translateY(0); }
+
+.statusbar {
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 50;
+  background: var(--inv-bg); color: var(--inv-fg); font-size: 11.5px;
+  padding: 6px 16px; display: flex; justify-content: space-between;
+  align-items: center; gap: 12px; overflow: hidden;
+}
+.status-left, .status-right { display: flex; align-items: center; gap: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.status-sep { opacity: 0.45; }
 </style>
 </head>
 <body>
-<div class="wrap">
-<h1>Paste2Run <small>v__VERSION__</small></h1>
-<div class="sub"><span class="dot" id="dot"></span><span id="state">正在连接本地服务…</span></div>
+<div class="shell">
+  <div class="topbar">
+    <div class="topbar-left">
+      <span class="badge solid">P2R // v__VERSION__</span>
+      <span class="badge"><span class="pulse off" id="dot"></span><span id="state-text">CONNECTING…</span></span>
+    </div>
+    <div class="topbar-right">
+      <button class="sm" id="btn-refresh">[ ↻ SYNC ]</button>
+      <button class="sm" id="btn-theme">[ ◐ INVERT B/W ]</button>
+    </div>
+  </div>
 
-<div class="card">
-<h2><span>1</span>装油猴脚本</h2>
-<div class="row"><a class="btn primary" href="/p2r.user.js">一键安装 / 更新脚本</a></div>
-<div class="tip">需要先装好 Tampermonkey（Chrome / Edge / Firefox 都有）。点上面按钮会直接弹安装页</div>
+  <section class="hero">
+    <div class="hero-grid">
+      <pre class="ascii-logo" aria-label="PASTE2RUN">██████╗  █████╗ ███████╗████████╗███████╗██████╗ ██████╗ ██╗   ██╗███╗   ██╗
+██╔══██╗██╔══██╗██╔════╝╚══██╔══╝██╔════╝╚════██╗██╔══██╗██║   ██║████╗  ██║
+██████╔╝███████║███████╗   ██║   █████╗   █████╔╝██████╔╝██║   ██║██╔██╗ ██║
+██╔═══╝ ██╔══██║╚════██║   ██║   ██╔══╝  ██╔═══╝ ██╔══██╗██║   ██║██║╚██╗██║
+██║     ██║  ██║███████║   ██║   ███████╗███████╗██║  ██║╚██████╔╝██║ ╚████║
+╚═╝     ╚═╝  ╚═╝╚══════╝   ╚═╝   ╚══════╝╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝</pre>
+      <div class="hero-meta">
+        <div class="hero-tagline">ZERO-DEPENDENCY LOCAL AI-TO-DISK BRIDGE</div>
+        <div class="hero-tagline">网页 AI 代码流 ──▶ 本地工程目录自动落地</div>
+      </div>
+    </div>
+    <div class="pipeline">
+      <div class="pipe-flow">[ AI STREAM ] <span>───▶</span> [ USERSCRIPT ] <span>───▶</span> [ PARSER / GUARD ] <span>───▶</span> [ DISK + BACKUP ] <span>───▶</span> [ EXEC ]<span class="cursor"></span></div>
+      <div id="clock">--:--:--</div>
+    </div>
+  </section>
+
+  <main class="grid">
+    <div class="col">
+      <section class="panel">
+        <div class="panel-head">
+          <div class="panel-title"><span class="idx">01 //</span>USERSCRIPT BRIDGE</div>
+          <span style="color:var(--fg-dim)">TAMPERMONKEY</span>
+        </div>
+        <div class="panel-body">
+          <div class="row">
+            <a class="btn primary" href="/p2r.user.js">[ ↓ INSTALL / UPDATE p2r.user.js ]</a>
+            <button id="btn-copy-endpoint">[ COPY ENDPOINT ]</button>
+          </div>
+          <div class="hint">需要先安装 Tampermonkey。从本页安装会自动注入当前端口与 <code>X-P2R-Token</code>。</div>
+          <div class="sites-bar">
+            <span class="site-tag">ChatGPT</span>
+            <span class="site-tag">Claude</span>
+            <span class="site-tag">Gemini</span>
+            <span class="site-tag">DeepSeek</span>
+            <span class="site-tag">腾讯元宝</span>
+            <span class="site-tag">豆包</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <div class="panel-title"><span class="idx">02 //</span>TARGET FILESYSTEM</div>
+          <span style="color:var(--fg-dim)">CONFIG</span>
+        </div>
+        <div class="panel-body">
+          <div class="row">
+            <input type="text" id="target-input" placeholder="__TARGET__" aria-label="落地目标目录">
+            <button class="primary" id="btn-save">[ SAVE ]</button>
+          </div>
+          <div class="toggle-row" id="toggle-run" role="checkbox" aria-checked="false" tabindex="0">
+            <span class="toggle-label">
+              <span class="ascii-ck" id="run-ck">[ ]</span>
+              <span>落地后自动执行 <code>===RUN===</code> 命令</span>
+            </span>
+            <span id="run-state-tag" style="font-size:11px;color:var(--fg-dim)">SAFE: OFF</span>
+          </div>
+          <div class="sec-grid">
+            <div class="sec-item"><span class="k">BIND</span><span class="v">127.0.0.1</span></div>
+            <div class="sec-item"><span class="k">AUTH</span><span class="v">X-P2R-TOKEN</span></div>
+            <div class="sec-item"><span class="k">GUARD</span><span class="v">NO ../ .git .p2r</span></div>
+            <div class="sec-item"><span class="k">BACKUP</span><span class="v">.p2r/backup/</span></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <div class="panel-title"><span class="idx">03 //</span>PROMPT PROTOCOL</div>
+          <div class="row" style="gap:4px">
+            <button class="tab active" data-preset="std">STD</button>
+            <button class="tab" data-preset="strict">STRICT</button>
+            <button class="tab" data-preset="patch">PATCH</button>
+          </div>
+        </div>
+        <div class="panel-body">
+          <div class="row" style="justify-content:space-between">
+            <span style="font-size:11.5px;color:var(--fg-dim)">粘贴至 AI 对话末尾，触发自动解析</span>
+            <button class="primary sm" id="btn-copy-prompt">[ COPY PROMPT ]</button>
+          </div>
+          <pre class="box" id="prompt-box"></pre>
+        </div>
+      </section>
+    </div>
+
+    <div class="col">
+      <section class="panel">
+        <div class="panel-head">
+          <div class="panel-title"><span class="idx">04 //</span>MANUAL APPLY // DRY-RUN</div>
+          <button class="sm" id="btn-load-sample">[ LOAD SAMPLE ]</button>
+        </div>
+        <div class="panel-body">
+          <textarea id="paste-input" placeholder="直接粘贴包含 ===FILE: 路径=== 的 AI 回复文本，支持试运行预览或直接落盘…"></textarea>
+          <div class="row" style="margin-top:10px;justify-content:space-between">
+            <div class="row">
+              <button id="btn-dry-run">[ DRY-RUN PREVIEW ]</button>
+              <button class="primary" id="btn-apply-now">[ APPLY TO DISK ]</button>
+            </div>
+            <button class="sm" id="btn-clear-paste">[ CLEAR ]</button>
+          </div>
+          <pre class="box" id="apply-output" style="display:none"></pre>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <div class="panel-title"><span class="idx">05 //</span>PROJECT TREE</div>
+          <div class="row" style="gap:6px">
+            <span id="tree-count" style="font-size:11px;color:var(--fg-dim)">—</span>
+            <button class="sm" id="btn-refresh-tree">[ ↻ ]</button>
+          </div>
+        </div>
+        <div class="panel-body">
+          <pre class="box tree-box" id="tree-box" style="margin-top:0">加载目录树…</pre>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <div class="panel-title"><span class="idx">06 //</span>LAST APPLY &amp; RUNNER</div>
+          <span id="last-time" style="font-size:11px;color:var(--fg-dim)">NO RECORD</span>
+        </div>
+        <div class="panel-body">
+          <div id="recent-wrap"><div style="color:var(--fg-dim)">还没有落地记录</div></div>
+          <div class="run-box" id="run-panel" style="display:none">
+            <div class="row" style="justify-content:space-between;margin-bottom:8px">
+              <span style="font-size:11px;color:var(--fg-dim)">DETECTED ===RUN===</span>
+              <div class="row" style="gap:6px">
+                <button class="sm" id="btn-exec-run">[ ▶ EXEC RUN ]</button>
+                <button class="sm" id="btn-copy-repair" style="display:none">[ COPY REPAIR PROMPT ]</button>
+              </div>
+            </div>
+            <div class="run-cmd" id="run-cmd-text"></div>
+            <pre class="box" id="run-output" style="display:none"></pre>
+          </div>
+        </div>
+      </section>
+    </div>
+  </main>
 </div>
 
-<div class="card">
-<h2><span>2</span>落地目录</h2>
-<div class="row">
-<input type="text" id="target" placeholder="__TARGET__">
-<button class="primary" id="save">保存</button>
-</div>
-<label class="ck"><input type="checkbox" id="run"> 落地后自动执行 ===RUN=== 命令</label>
-<div class="tip">路径不存在会自动创建；建议每个项目一个目录</div>
-</div>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
 
-<div class="card">
-<h2><span>3</span>提示词</h2>
-<div class="row"><button id="copy">复制提示词</button></div>
-<pre id="prompt">输出格式严格要求：
-每个文件用 ===FILE: 相对路径=== 开头，下面给该文件的完整内容，不要省略号，不要"其余同上"。
-所有文件给完后，用 ===RUN=== 开头给出启动命令。
-不要在文件内容里再嵌套 ===FILE: 这样的行。</pre>
-<div class="tip">把这段粘到对话末尾，AI 就会按格式输出，脚本自动落地</div>
-</div>
-
-<div class="card">
-<h2><span>4</span>最近一次落地</h2>
-<div id="recent" class="muted">还没有记录</div>
-</div>
-
-<div id="msg"></div>
-</div>
-<div class="sticky" id="bar">—</div>
+<footer class="statusbar">
+  <div class="status-left">
+    <strong>NORMAL</strong>
+    <span class="status-sep">│</span>
+    <span id="bar-target">DIR: —</span>
+  </div>
+  <div class="status-right">
+    <span id="bar-run">RUN: OFF</span>
+    <span class="status-sep">│</span>
+    <span id="bar-theme">THEME: DARK</span>
+  </div>
+</footer>
 
 <script>
-var TOKEN="__TOKEN__";
-var $=function(s){return document.querySelector(s)};
-function H(){return {"Content-Type":"application/json","X-P2R-Token":TOKEN}}
-function show(t){$("#msg").textContent=t}
+(function () {
+  "use strict";
+  const TOKEN = "__TOKEN__";
+  const PROMPTS = {
+    std:
+`输出格式严格要求：
+每个文件用 ===FILE: 相对路径=== 开头，下面给该文件的完整内容，不要省略号，不要"其余同上"。
+所有文件给完后，用 ===RUN=== 开头给出启动命令。
+不要在文件内容里再嵌套 ===FILE: 这样的行。`,
+    strict:
+`STRICT OUTPUT PROTOCOL (Paste2Run):
+1. Output ONLY ===FILE: relative/path=== sections and one optional ===RUN=== section.
+2. Provide complete, runnable file contents with ZERO omissions or placeholders.
+3. Do NOT add explanations after closing code fences.
+4. Keep paths relative (no leading /, no .., no .git/ or .p2r/).`,
+    patch:
+`请仅输出本次需要修改或新增的文件：
+每个文件以 ===FILE: 相对路径=== 开头并给出完整文件内容（不要 diff 片段，不要省略号）。
+如需新增依赖或重新构建，请在最后附加 ===RUN=== 段给出命令。`
+  };
+  const SAMPLE_REPLY = `===FILE: index.html===
+\`\`\`html
+<!doctype html>
+<html><body><h1>Hello Paste2Run</h1></body></html>
+\`\`\`
+===RUN===
+echo "Paste2Run OK"`;
 
-async function load(){
-  try{
-    var r=await fetch("/state",{cache:"no-store"});
-    var c=await r.json();
-    $("#target").value=c.target||"";
-    $("#run").checked=!!c.allow_run;
-    $("#dot").style.background="#3fb950";
-    $("#state").textContent="服务在线 · 端口 "+c.port;
-    $("#bar").textContent=c.target?("当前目录 "+c.target):"还没设落地目录";
-    renderRecent(c.last);
-  }catch(e){
-    $("#dot").style.background="#f85149";
-    $("#state").textContent="服务不在线";
+  const $ = (s) => document.querySelector(s);
+  const H = () => ({ "Content-Type": "application/json", "X-P2R-Token": TOKEN });
+  let curState = { allow_run: false, target: "", port: 18765, last: null };
+  let lastRunOutput = "";
+  let toastTimer = null;
+
+  function toast(msg) {
+    const el = $("#toast");
+    el.textContent = "> " + msg;
+    el.classList.add("show");
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => el.classList.remove("show"), 2600);
   }
-}
-
-function renderRecent(last){
-  var box=$("#recent");
-  if(!last||!last.time){box.textContent="还没有记录";return;}
-  var names=(last.files||[]).map(function(f){return "· "+f.path});
-  var more=names.length>6?"\n…共 "+names.length+" 个文件":"";
-  box.textContent=last.time+" · "+names.length+" 个文件\n"+names.slice(0,6).join("\n")+more+
-    (last.run?("\n\n启动命令："+last.run):"");
-}
-
-$("#save").onclick=async function(){
-  var body={target:$("#target").value.trim(),allow_run:$("#run").checked};
-  var r=await fetch("/config",{method:"POST",headers:H(),body:JSON.stringify(body)});
-  var j=await r.json();
-  show(j.ok?("已保存 "+j.target):("保存失败 "+(j.error||r.status)));
-  if(j.ok){$("#target").value=j.target;$("#bar").textContent="当前目录 "+j.target}
-};
-$("#run").onchange=function(){$("#save").click()};
-$("#copy").onclick=async function(){
-  var t=$("#prompt").textContent;
-  try{await navigator.clipboard.writeText(t);}
-  catch(e){
-    var r=document.createRange();r.selectNodeContents($("#prompt"));
-    var s=getSelection();s.removeAllRanges();s.addRange(r);
-    document.execCommand("copy");
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" }[c]));
   }
-  show("提示词已复制");
-};
-load();
+  function copyText(text, label) {
+    const fallback = () => {
+      const ta = document.createElement("textarea");
+      ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
+      document.body.appendChild(ta); ta.select();
+      try { document.execCommand("copy"); } catch (e) {}
+      document.body.removeChild(ta);
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).catch(fallback);
+    } else fallback();
+    toast(label || "COPIED");
+  }
+
+  function renderRunToggle() {
+    $("#run-ck").textContent = curState.allow_run ? "[■]" : "[ ]";
+    $("#toggle-run").setAttribute("aria-checked", String(curState.allow_run));
+    $("#run-state-tag").textContent = curState.allow_run ? "ACTIVE: ON" : "SAFE: OFF";
+    $("#bar-run").textContent = "RUN: " + (curState.allow_run ? "ON" : "OFF");
+  }
+
+  function renderRecent(last) {
+    const wrap = $("#recent-wrap");
+    if (!last || !last.time) {
+      $("#last-time").textContent = "NO RECORD";
+      wrap.innerHTML = '<div style="color:var(--fg-dim)">还没有落地记录</div>';
+      $("#run-panel").style.display = "none";
+      return;
+    }
+    $("#last-time").textContent = last.time + " // " + (last.source || "web").toUpperCase();
+    const rows = (last.files || []).map((f) =>
+      `<tr><td>${escapeHtml(f.path)}</td><td class="num">${f.bytes} B</td><td class="num">${f.dryRun ? "DRY" : "OK"}</td></tr>`
+    ).join("");
+    const skipRows = (last.skipped || []).map((s) =>
+      `<tr><td>${escapeHtml(s.path)}</td><td class="num">—</td><td class="num">SKIPPED</td></tr>`
+    ).join("");
+    wrap.innerHTML = `<table class="manifest-table"><thead><tr><th>FILE PATH</th><th class="num">SIZE</th><th class="num">STATUS</th></tr></thead><tbody>${rows}${skipRows}</tbody></table>`;
+    if (last.run) {
+      $("#run-panel").style.display = "block";
+      $("#run-cmd-text").textContent = "$ " + last.run;
+    } else {
+      $("#run-panel").style.display = "none";
+    }
+  }
+
+  async function loadTree() {
+    try {
+      const r = await fetch("/tree", { cache: "no-store" });
+      const j = await r.json();
+      if (j.ok) {
+        const lines = j.tree ? j.tree.split("\n") : [];
+        $("#tree-box").textContent = (j.target || ".") + "/\n" + (j.tree || "(空目录)");
+        $("#tree-count").textContent = lines.length + " ENTRIES";
+      } else {
+        $("#tree-box").textContent = "[ERR] " + (j.error || "无法读取目录");
+      }
+    } catch (e) {
+      $("#tree-box").textContent = "[OFFLINE] 无法连接本地服务";
+    }
+  }
+
+  async function loadState() {
+    try {
+      const r = await fetch("/state", { cache: "no-store" });
+      const c = await r.json();
+      curState = c;
+      $("#target-input").value = c.target || "";
+      $("#dot").classList.remove("off");
+      $("#state-text").textContent = "ONLINE :" + c.port;
+      $("#bar-target").textContent = c.target ? ("DIR: " + c.target) : "DIR: UNSET";
+      renderRunToggle();
+      renderRecent(c.last);
+      loadTree();
+    } catch (e) {
+      $("#dot").classList.add("off");
+      $("#state-text").textContent = "OFFLINE";
+    }
+  }
+
+  async function saveConfig(nextAllowRun) {
+    const body = {
+      target: $("#target-input").value.trim(),
+      allow_run: typeof nextAllowRun === "boolean" ? nextAllowRun : curState.allow_run
+    };
+    const r = await fetch("/config", { method: "POST", headers: H(), body: JSON.stringify(body) });
+    const j = await r.json();
+    if (j.ok) {
+      curState.target = j.target;
+      curState.allow_run = !!j.allow_run;
+      $("#target-input").value = j.target;
+      $("#bar-target").textContent = "DIR: " + j.target;
+      renderRunToggle();
+      loadTree();
+      toast("SAVED: " + j.target);
+    } else {
+      toast("SAVE FAILED: " + (j.error || r.status));
+    }
+  }
+
+  async function submitApply(dryRun) {
+    const text = $("#paste-input").value;
+    const outBox = $("#apply-output");
+    if (!text.trim()) return toast("PASTE INPUT IS EMPTY");
+    try {
+      const r = await fetch("/apply", {
+        method: "POST", headers: H(),
+        body: JSON.stringify({ text, dryRun, source: "web-console" })
+      });
+      const j = await r.json();
+      outBox.style.display = "block";
+      if (!j.ok) {
+        outBox.textContent = "[ERR] " + (j.error || r.status);
+        toast("APPLY FAILED");
+        return;
+      }
+      const lines = [
+        dryRun ? "=== DRY-RUN REPORT ===" : "=== APPLY COMPLETE ===",
+        `TARGET : ${j.target}`,
+        `WRITTEN: ${(j.files || []).length} file(s)`,
+        ...(j.files || []).map((f) => `  + ${f.path} (${f.bytes} B)`),
+      ];
+      if ((j.skipped || []).length) {
+        lines.push(`SKIPPED: ${j.skipped.length} file(s)`);
+        j.skipped.forEach((s) => lines.push(`  ! ${s.path} -> ${s.reason}`));
+      }
+      if (j.run) lines.push(`RUN CMD: ${j.run}`);
+      outBox.textContent = lines.join("\n");
+      toast(dryRun ? "DRY-RUN DONE" : `WRITTEN ${(j.files || []).length} FILE(S)`);
+      if (!dryRun) loadState();
+    } catch (e) {
+      toast("REQUEST ERROR");
+    }
+  }
+
+  $("#btn-save").addEventListener("click", () => saveConfig());
+  const onToggleRun = () => saveConfig(!curState.allow_run);
+  $("#toggle-run").addEventListener("click", onToggleRun);
+  $("#toggle-run").addEventListener("keydown", (e) => { if (e.key === " " || e.key === "Enter") { e.preventDefault(); onToggleRun(); } });
+  $("#btn-refresh").addEventListener("click", () => { loadState(); toast("SYNCED"); });
+  $("#btn-refresh-tree").addEventListener("click", () => { loadTree(); toast("TREE REFRESHED"); });
+  $("#btn-copy-endpoint").addEventListener("click", () => copyText(location.origin, "ENDPOINT COPIED"));
+  $("#btn-load-sample").addEventListener("click", () => { $("#paste-input").value = SAMPLE_REPLY; toast("SAMPLE LOADED"); });
+  $("#btn-dry-run").addEventListener("click", () => submitApply(true));
+  $("#btn-apply-now").addEventListener("click", () => submitApply(false));
+  $("#btn-clear-paste").addEventListener("click", () => { $("#paste-input").value = ""; $("#apply-output").style.display = "none"; });
+
+  document.querySelectorAll("button.tab[data-preset]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      document.querySelectorAll("button.tab[data-preset]").forEach((b) => b.classList.remove("active"));
+      btn.classList.add("active");
+      $("#prompt-box").textContent = PROMPTS[btn.dataset.preset];
+    });
+  });
+  $("#btn-copy-prompt").addEventListener("click", () => copyText($("#prompt-box").textContent, "PROMPT COPIED"));
+
+  $("#btn-exec-run").addEventListener("click", async () => {
+    const out = $("#run-output");
+    out.style.display = "block";
+    out.textContent = "EXECUTING…";
+    try {
+      const r = await fetch("/run", { method: "POST", headers: H(), body: JSON.stringify({}) });
+      const j = await r.json();
+      if (j.error) {
+        out.textContent = `[ERR] ${j.error}`;
+        $("#btn-copy-repair").style.display = "none";
+      } else {
+        lastRunOutput = j.output || "";
+        out.textContent = `[EXIT ${j.code}] (${j.duration}s)\n` + (lastRunOutput || "(no output)");
+        $("#btn-copy-repair").style.display = j.ok ? "none" : "inline-flex";
+        toast(j.ok ? `RUN OK (${j.duration}s)` : `RUN FAILED (EXIT ${j.code})`);
+      }
+    } catch (e) {
+      out.textContent = "[ERR] 请求失败";
+    }
+  });
+
+  $("#btn-copy-repair").addEventListener("click", async () => {
+    try {
+      const r = await fetch("/repair", { method: "POST", headers: H(), body: JSON.stringify({ output: lastRunOutput }) });
+      const j = await r.json();
+      if (j.ok && j.prompt) copyText(j.prompt, "REPAIR PROMPT COPIED");
+    } catch (e) { toast("REPAIR FAILED"); }
+  });
+
+  $("#btn-theme").addEventListener("click", () => {
+    const isLight = document.documentElement.getAttribute("data-theme") === "light";
+    document.documentElement.setAttribute("data-theme", isLight ? "dark" : "light");
+    $("#bar-theme").textContent = "THEME: " + (isLight ? "DARK" : "LIGHT");
+    try { localStorage.setItem("p2r_theme", isLight ? "dark" : "light"); } catch (e) {}
+  });
+
+  function tick() { $("#clock").textContent = "SYS " + new Date().toTimeString().slice(0, 8); }
+  tick(); setInterval(tick, 1000);
+  try {
+    if (localStorage.getItem("p2r_theme") === "light") {
+      document.documentElement.setAttribute("data-theme", "light");
+      $("#bar-theme").textContent = "THEME: LIGHT";
+    }
+  } catch (e) {}
+  $("#prompt-box").textContent = PROMPTS.std;
+  loadState();
+})();
 </script>
 </body>
 </html>
@@ -399,9 +928,9 @@ load();
 
 
 def setup_html(cfg):
-    return (SETUP_HTML.replace("__VERSION__", VERSION)
-            .replace("__TOKEN__", cfg.get("token", ""))
-            .replace("__TARGET__", cfg.get("target") or DEFAULT_TARGET))
+    return (SETUP_HTML.replace("__VERSION__", html.escape(VERSION, quote=True))
+            .replace("__TOKEN__", html.escape(cfg.get("token", ""), quote=True))
+            .replace("__TARGET__", html.escape(cfg.get("target") or DEFAULT_TARGET, quote=True)))
 
 
 def userscript_text(cfg):
@@ -431,7 +960,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- 基础校验 ----
     def _host_ok(self):
-        host = (self.headers.get("Host") or "").split(":")[0].strip().lower()
+        host = parse_host_header(self.headers.get("Host"))
         return host in ("127.0.0.1", "localhost", "::1", "[::1]")
 
     def _origin_ok(self):
@@ -439,7 +968,11 @@ class Handler(BaseHTTPRequestHandler):
         if not origin:
             return True
         port = _CURRENT_PORT[0]
-        return origin in ("http://127.0.0.1:%d" % port, "http://localhost:%d" % port)
+        return origin in (
+            "http://127.0.0.1:%d" % port,
+            "http://localhost:%d" % port,
+            "http://[::1]:%d" % port,
+        )
 
     def _token_ok(self):
         cfg = load_config()
@@ -506,8 +1039,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._raw(200, src.encode("utf-8"), "application/javascript; charset=utf-8")
 
         if path == "/ping":
-            return self._json(200, {"ok": True, "version": VERSION, "port": _CURRENT_PORT[0],
-                                    "target": cfg.get("target")})
+            return self._json(200, {
+                "ok": True, "version": VERSION, "port": _CURRENT_PORT[0],
+                "target": cfg.get("target"), "allow_run": bool(cfg.get("allow_run")),
+            })
 
         if path == "/state":
             target = cfg.get("target")
@@ -530,11 +1065,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, pub)
 
         if path == "/tree":
-            qs = self.path.split("?", 1)[1] if "?" in self.path else ""
             target = cfg.get("target")
-            for part in qs.split("&"):
-                if part.startswith("target="):
-                    target = urllib.parse.unquote(part.split("=", 1)[1])
             if not target:
                 return self._json(400, {"ok": False, "error": "没有目标目录"})
             root = os.path.abspath(os.path.expanduser(target))
@@ -707,26 +1238,33 @@ npm install && npm run dev
     assert "hi" in files[0][1]
     assert run_cmds.startswith("npm install")
 
-    fenced = "===FILE: a.txt===\n```js\nx\n```\n"
-    f2, _ = parse(fenced)
-    assert f2[0][1].strip() == "x", f2
+    fenced_prose = "===FILE: a.py===\n```python\nprint(1)\n```\n\n希望这能帮到你！\n"
+    f2, _ = parse(fenced_prose)
+    assert f2[0][1].strip() == "print(1)", f2
+
+    run_before_file = "===FILE: a.txt===\n1\n===RUN===\necho ok\n===FILE: b.txt===\n2\n"
+    f_ord, r_ord = parse(run_before_file)
+    assert len(f_ord) == 2 and r_ord == "echo ok", (f_ord, r_ord)
 
     bold = "**===FILE: ./src/b.js===**\nconsole.log(1)\n"
     f3, _ = parse(bold)
     assert f3 and f3[0][0] == "./src/b.js", f3
 
+    assert parse_host_header("[::1]:18765") == "[::1]"
+    assert parse_host_header("127.0.0.1:18765") == "127.0.0.1"
+
     import tempfile
     with tempfile.TemporaryDirectory() as tmp:
         res = apply_text(sample, tmp)
         assert res["ok"] and os.path.exists(os.path.join(tmp, "src", "main.js"))
-        bad = apply_text("===FILE: ../evil.txt===\nx\n", tmp)
-        assert bad["ok"] and bad["files"] == [] and bad["skipped"], bad
+        bad = apply_text("===FILE: ../evil.txt===\nx\n===FILE: .git/hooks/pre-commit===\ny\n", tmp)
+        assert bad["ok"] and bad["files"] == [] and len(bad["skipped"]) == 2, bad
         once = apply_text("===FILE: index.html===\nv2\n", tmp)
         assert once["ok"] and os.path.exists(os.path.join(tmp, ".p2r", "last-apply.json"))
         bdir = os.path.join(tmp, ".p2r", "backup")
         assert os.path.isdir(bdir) and os.listdir(bdir), "覆写没有备份"
 
-    print("selftest ok: 解析 / 围栏 / 加粗标记 / 越界拒绝 / 覆写备份 全部通过")
+    print("selftest ok: 解析 / 围栏与尾随结语 / 乱序RUN / 加粗标记 / 越界与.git拦截 / IPv6 Host / 覆写备份 全部通过")
 
 
 def main():
