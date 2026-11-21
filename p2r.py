@@ -37,7 +37,7 @@ import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.4.1"
+VERSION = "0.4.2"
 HOME = os.path.expanduser("~/.p2r")
 CONFIG = os.path.join(HOME, "config.json")
 LOG = os.path.join(HOME, "p2r.log")
@@ -530,38 +530,98 @@ def _port_open(port, host="127.0.0.1", timeout=0.6):
         return False
 
 
+def _pids_on_port(port):
+    """找出监听指定端口的进程（无第三方依赖，平台各用各的命令）。"""
+    pids = set()
+    if not port:
+        return pids
+    try:
+        if os.name == "nt":
+            out = subprocess.run(["netstat", "-ano"], capture_output=True, text=True, timeout=6).stdout
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) >= 5 and parts[-2].upper() == "LISTENING" and parts[1].endswith(":%d" % port):
+                    if parts[-1].isdigit():
+                        pids.add(int(parts[-1]))
+        elif sys.platform == "darwin":
+            out = subprocess.run(["lsof", "-ti", "tcp:%d" % port],
+                                 capture_output=True, text=True, timeout=6).stdout
+            pids.update(int(x) for x in out.split() if x.isdigit())
+        else:
+            out = subprocess.run(["ss", "-lntp"], capture_output=True, text=True, timeout=6).stdout
+            for line in out.splitlines():
+                if (":%d" % port) in line:
+                    pids.update(int(m) for m in re.findall(r"pid=(\d+)", line))
+    except Exception:
+        pass
+    return pids
+
+
 def stop_dev_server(root):
-    """停止该项目记录在 .p2r/dev.pid 的后台服务。"""
+    """停止该项目记录在 .p2r/dev.pid 的后台服务，以端口是否关闭作为最终依据。"""
     pidf = os.path.join(root, ".p2r", "dev.pid")
     urlf = os.path.join(root, ".p2r", "dev.url")
-    if not os.path.isfile(pidf):
-        return {"ok": False, "error": "没有正在运行的后台服务记录"}
+    url = None
+    pid = None
     try:
-        pid = int(open(pidf, encoding="utf-8").read().strip())
+        if os.path.isfile(urlf):
+            url = open(urlf, encoding="utf-8").read().strip() or None
+        if os.path.isfile(pidf):
+            pid = int(open(pidf, encoding="utf-8").read().strip())
     except Exception:
-        pid = None
-    stopped = False
+        pass
+
+    if not pid and not url:
+        return {"ok": False, "error": "没有正在运行的后台服务记录"}
+
+    port = None
+    if url:
+        pm = re.search(r":(\d+)", url)
+        if pm:
+            port = int(pm.group(1))
+
     if pid:
-        try:
-            if os.name == "nt":
-                subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
-            else:
-                os.killpg(os.getpgid(pid), signal.SIGTERM)
-            stopped = True
-        except Exception:
+        for sig in (signal.SIGTERM, signal.SIGKILL):
             try:
-                os.kill(pid, signal.SIGTERM)
-                stopped = True
+                if os.name == "nt":
+                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+                    break
+                try:
+                    os.killpg(os.getpgid(pid), sig)
+                except ProcessLookupError:
+                    break
+                except Exception:
+                    os.kill(pid, sig)
             except Exception:
                 pass
+            time.sleep(0.6)
+
+    # 记录的 pid 可能已经退出（shell 被接管/重启过），端口还占着就按端口兑底
+    if port and _port_open(port, timeout=0.2):
+        for other in _pids_on_port(port):
+            if other == os.getpid():
+                continue
+            try:
+                os.kill(other, signal.SIGTERM)
+            except Exception:
+                pass
+
+    # 以「端口是不是真的关了」为准，不依赖进程信号是否报错
+    stopped = False
+    for _ in range(12):
+        if port is None or not _port_open(port, timeout=0.2):
+            stopped = True
+            break
+        time.sleep(0.25)
+
     for fp in (pidf, urlf):
         try:
             os.remove(fp)
         except OSError:
             pass
-    log("dev-server stop pid=%s stopped=%s" % (pid, stopped))
-    return {"ok": True, "pid": pid, "stopped": stopped}
+    log("dev-server stop pid=%s port=%s stopped=%s" % (pid, port, stopped))
+    return {"ok": True, "pid": pid, "port": port, "stopped": stopped}
 
 
 def start_dev_server(root, cmd, wait=25):
@@ -641,6 +701,109 @@ def start_dev_server(root, cmd, wait=25):
     return {"ok": True, "pid": proc.pid, "url": url, "output": out, "alive": alive}
 
 
+def split_chain(cmds):
+    """把 `a && b; c` 拆成独立命令。"""
+    return [p.strip() for p in re.split(r"&&|;|\n", cmds or "") if p.strip()]
+
+
+def run_pipeline(root, cmds, timeout=300, wait=25):
+    """两阶段执行：前置 install/build 同步跑完，最后一条长驻命令才后台起。
+
+    修的是这个坑：`npm install && npm run dev` 整条交给 start_dev_server 时，
+    install 一旦超过 wait 秒就会误报「没抓到地址」。
+    """
+    parts = split_chain(cmds)
+    if not parts:
+        return {"ok": False, "error": "没有可执行的命令", "code": None,
+                "output": "", "stages": []}
+
+    info = detect_project(root)
+    plan_like = {"longRunning": bool(info.get("long_running")),
+                 "commands": info.get("commands") or []}
+    stages, outs = [], []
+
+    for i, part in enumerate(parts):
+        is_last = i == len(parts) - 1
+        if is_last and (looks_long_running(part) or _is_entry_cmd(part, plan_like)):
+            res = start_dev_server(root, part, wait=wait)
+            res["longRunning"] = True
+            res["stages"] = stages
+            res.setdefault("duration", 0)
+            res["output"] = ("".join(outs)[-MAX_TAIL:] + (res.get("output") or ""))[-MAX_TAIL:]
+            return res
+
+        r = run_in(root, part, timeout=timeout)
+        stages.append({"cmd": part, "ok": bool(r.get("ok")),
+                       "code": r.get("code"), "duration": r.get("duration")})
+        outs.append(r.get("output") or "")
+        if not r.get("ok"):
+            r["stages"] = stages
+            r["failedStage"] = part
+            r["output"] = r.get("output") or "".join(outs)[-MAX_TAIL:]
+            return r
+
+    return {"ok": True, "code": 0, "output": "".join(outs)[-MAX_TAIL:],
+            "stages": stages, "duration": round(sum(s.get("duration") or 0 for s in stages), 1)}
+
+
+def dev_server_status(root):
+    """当前项目有没有活着的后台服务。"""
+    pidf = os.path.join(root, ".p2r", "dev.pid")
+    urlf = os.path.join(root, ".p2r", "dev.url")
+    url = None
+    pid = None
+    try:
+        if os.path.isfile(urlf):
+            url = open(urlf, encoding="utf-8").read().strip() or None
+        if os.path.isfile(pidf):
+            pid = int(open(pidf, encoding="utf-8").read().strip())
+    except Exception:
+        pass
+    alive = False
+    if url:
+        pm = re.search(r":(\d+)", url)
+        alive = bool(pm and _port_open(int(pm.group(1))))
+    return {"alive": alive, "url": url, "pid": pid}
+
+
+def rollback_last(root):
+    """把 .p2r/backup/last 里的快照盖回项目（回滚前先存一份 pre-rollback）。"""
+    bdir = os.path.join(root, ".p2r", "backup", "last")
+    if not os.path.isdir(bdir):
+        return {"ok": False, "error": "没有可回滚的备份（.p2r/backup/last 不存在）"}
+
+    files = []
+    for dirpath, _dirs, names in os.walk(bdir):
+        for name in names:
+            full = os.path.join(dirpath, name)
+            files.append(os.path.relpath(full, bdir))
+    if not files:
+        return {"ok": False, "error": "备份目录是空的"}
+
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    pre = os.path.join(root, ".p2r", "backup", "pre-rollback")
+    if os.path.isdir(pre):
+        shutil.rmtree(pre, ignore_errors=True)
+
+    restored, failed = [], []
+    for rel in files:
+        try:
+            target = safe_target(root, rel.replace(os.sep, "/"))
+            if os.path.exists(target):
+                keep = os.path.join(pre, rel)
+                os.makedirs(os.path.dirname(keep), exist_ok=True)
+                shutil.copy2(target, keep)
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            shutil.copy2(os.path.join(bdir, rel), target)
+            restored.append(rel.replace(os.sep, "/"))
+        except Exception as exc:
+            failed.append({"path": rel, "reason": str(exc)})
+
+    log("rollback target=%s restored=%d failed=%d" % (root, len(restored), len(failed)))
+    return {"ok": bool(restored), "restored": restored, "failed": failed,
+            "preRollback": os.path.relpath(pre, root), "stamp": stamp}
+
+
 def open_target(path_or_url):
     """跨平台打开文件或网址。"""
     raw = path_or_url
@@ -680,7 +843,7 @@ def open_project(root, allow_run=False):
                     "error": "该项目需启动本地服务，请先开启「自动执行 ===RUN===」或按下方方案手动运行",
                     "plan": minimal_run_plan(root)}
         cmd = " && ".join(info["commands"])
-        res = start_dev_server(root, cmd)
+        res = run_pipeline(root, cmd)
         if res.get("url"):
             opened = open_target(res["url"])
             return {"ok": True, "mode": "server", "url": res["url"],
@@ -1097,6 +1260,8 @@ pre.tree-box { white-space: pre; word-break: normal; max-height: 220px; }
           <div class="row" style="margin:10px 0 4px">
             <button class="sm" id="btn-open-project">[ ◎ OPEN PROJECT ]</button>
             <button class="sm" id="btn-stop-server">[ ■ STOP SERVER ]</button>
+            <button class="sm" id="btn-rollback">[ ↩ ROLLBACK ]</button>
+            <span id="dev-state" style="font-size:11px;color:var(--fg-dim);align-self:center">SERVER: OFF</span>
           </div>
           <div class="hint" style="margin-bottom:10px">静态页直接开；带 dev server 的项目会后台起服务再开，不用自己去目录里点 index.html。</div>
           <div class="run-box" id="run-panel" style="display:none">
@@ -1216,6 +1381,18 @@ echo "Paste2Run OK"`;
     } catch (e) { toast("SET FAILED"); }
   }
 
+  function renderDevState(dev) {
+    const el = $("#dev-state");
+    if (!el) return;
+    if (dev && dev.alive) {
+      el.textContent = "SERVER: ON " + (dev.url || "");
+      el.style.color = "var(--fg)";
+    } else {
+      el.textContent = "SERVER: OFF";
+      el.style.color = "var(--fg-dim)";
+    }
+  }
+
   function renderRecent(last) {
     const wrap = $("#recent-wrap");
     if (!last || !last.time) {
@@ -1266,6 +1443,7 @@ echo "Paste2Run OK"`;
       $("#state-text").textContent = "ONLINE :" + c.port;
       $("#bar-target").textContent = c.target ? ("DIR: " + c.target) : "DIR: UNSET";
       renderRunToggle();
+      renderDevState(c.devServer);
       renderRecent(c.last);
       loadTree();
     } catch (e) {
@@ -1377,6 +1555,25 @@ echo "Paste2Run OK"`;
       const j = await r.json();
       out.textContent = j.ok ? `[STOPPED] pid=${j.pid || "-"}` : `[ERR] ${j.error || "停止失败"}`;
       toast(j.ok ? "后台服务已停止" : (j.error || "没有运行中的服务"));
+      loadState();
+    } catch (e) { out.textContent = "[ERR] 请求失败"; }
+  });
+
+  $("#btn-rollback").addEventListener("click", async () => {
+    const out = $("#run-output");
+    out.style.display = "block";
+    if (!confirm("用 .p2r/backup/last 里的快照覆盖当前文件？当前版本会存到 backup/pre-rollback")) return;
+    try {
+      const r = await fetch("/rollback", { method: "POST", headers: H(), body: JSON.stringify({}) });
+      const j = await r.json();
+      if (j.ok) {
+        out.textContent = `[ROLLBACK OK] ${j.restored.length} file(s)\n` + j.restored.map((p) => "  < " + p).join("\n");
+        toast(`已回滚 ${j.restored.length} 个文件`);
+        loadState();
+      } else {
+        out.textContent = `[ERR] ${j.error || "回滚失败"}`;
+        toast(j.error || "回滚失败");
+      }
     } catch (e) { out.textContent = "[ERR] 请求失败"; }
   });
 
@@ -1585,18 +1782,22 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/state":
             target = cfg.get("target")
             last = None
+            dev = None
             if target:
-                lp = os.path.join(os.path.abspath(os.path.expanduser(target)), ".p2r", "last-apply.json")
+                troot = os.path.abspath(os.path.expanduser(target))
+                lp = os.path.join(troot, ".p2r", "last-apply.json")
                 if os.path.exists(lp):
                     try:
                         with open(lp, encoding="utf-8") as fh:
                             last = json.load(fh)
                     except Exception:
                         last = None
+                dev = dev_server_status(troot)
             return self._json(200, {"ok": True, "version": VERSION, "port": _CURRENT_PORT[0],
                                     "target": target, "allow_run": bool(cfg.get("allow_run")),
                                     "backup_mode": cfg.get("backup_mode"),
-                                    "auto_open": cfg.get("auto_open"), "last": last})
+                                    "auto_open": cfg.get("auto_open"),
+                                    "devServer": dev, "last": last})
 
         if path == "/config":
             pub = {k: cfg.get(k) for k in ("target", "allow_run", "backup_mode", "auto_open")}
@@ -1657,6 +1858,11 @@ class Handler(BaseHTTPRequestHandler):
             res["target"] = root
             return self._json(200 if res.get("ok") else 404, res)
 
+        if path == "/rollback":
+            res = rollback_last(root)
+            res["target"] = root
+            return self._json(200 if res.get("ok") else 422, res)
+
         if path == "/run" or path == "/repair":
             if path == "/repair":
                 output = body.get("output") or ""
@@ -1689,23 +1895,24 @@ class Handler(BaseHTTPRequestHandler):
                         cmds = ""
             # 先用静态推断补全安装步骤，但 ===RUN=== 里用户自己的命令优先
             plan = minimal_run_plan(root)
-            long_run = looks_long_running(cmds) or _is_entry_cmd(cmds, plan)
-            if long_run:
-                res = start_dev_server(root, cmds)
-                res["class"] = "env" if not res.get("ok") or not res.get("alive") else "ok"
-                res["longRunning"] = True
-                if res.get("url"):
-                    res["open"] = open_target(res["url"])
-                res["target"] = root
-                res["plan"] = plan
-                log("run(long-running) url=%s alive=%s" % (res.get("url"), res.get("alive")))
-                return self._json(200, res)
-
-            res = run_in(root, cmds)
+            res = run_pipeline(root, cmds)
             res["target"] = root
             res["plan"] = plan
+            if res.get("longRunning"):
+                res["class"] = "env" if (not res.get("ok") or not res.get("alive")) else "ok"
+                if res.get("url"):
+                    res["open"] = open_target(res["url"])
+                log("run(long-running) url=%s alive=%s stages=%d"
+                    % (res.get("url"), res.get("alive"), len(res.get("stages") or [])))
+                return self._json(200, res)
+
             if not res.get("ok"):
                 res.update(classify_error(res.get("output"), res.get("code")))
+                stages = res.get("stages") or []
+                if res.get("failedStage") and len(stages) > 1:
+                    res["hint"] = ("第 %d/%d 步失败（%s）。%s"
+                                    % (len(stages), len(split_chain(cmds)),
+                                       res["failedStage"][:60], res.get("hint") or ""))
             # 跑完如果项目有页面入口，顺手打开，少让用户自己找 index
             if res.get("ok") and cfg.get("auto_open") in ("static", "always"):
                 entry = plan.get("entry")
@@ -1876,6 +2083,18 @@ npm install && npm run dev
         stamps = [d for d in os.listdir(bdir) if d != "last"]
         assert len(stamps) <= 1, "last 模式不应该产生多个时间戳目录: %s" % stamps
         assert os.path.isfile(os.path.join(last_dir, "index.html")), "last 模式没有备份到文件"
+
+        # 一键回滚：last 里存的是上一版，回滚后应盖回去，且当前版留在 pre-rollback
+        rb = rollback_last(tmp)
+        assert rb["ok"] and rb["restored"], rb
+        assert open(os.path.join(tmp, "index.html"), encoding="utf-8").read().strip() == "v2", rb
+        assert os.path.isdir(os.path.join(tmp, ".p2r", "backup", "pre-rollback"))
+        assert os.path.isfile(os.path.join(tmp, ".p2r", "backup", "pre-rollback", "index.html"))
+
+        # 链式命令拆分
+        assert split_chain("npm install && npm run dev") == ["npm install", "npm run dev"]
+        assert split_chain("a; b\nc") == ["a", "b", "c"]
+        assert split_chain("  ") == []
 
         # 错误归因
         env_cases = [

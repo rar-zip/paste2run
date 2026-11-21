@@ -1,7 +1,7 @@
 # Paste2Run
 
 > 网页 AI 写好的代码，直接落进你本地的项目目录。
-> **v0.4.1 · Python 3.8+ · 零第三方依赖 · 黑白极简 ASCII 控制台 · MIT License**
+> **v0.4.2 · Python 3.8+ · 零第三方依赖 · 黑白极简 ASCII 控制台 · MIT License**
 
 在 ChatGPT / Claude / Gemini / DeepSeek / 腾讯元宝 / 豆包里让 AI 生成完整项目时，最耗时间的往往不是写提示词，而是把一整页带文件名的代码逐个新建、复制、粘贴、保存。**Paste2Run** 把这一步变成全自动：AI 回复结束，文件已经在你的工程目录里，可选自动执行构建命令，报错还能一键生成修复提示词。
 
@@ -141,7 +141,9 @@ Paste2Run 具备本地写盘与执行命令能力，因此所有边界默认收�
 | `POST` | `/apply` | 需要 Token | 解析并写入文件，支持 `{ text, target?, dryRun?, source? }` |
 | `POST` | `/run` | 需要 Token | 执行最近一次或指定的 `===RUN===` 命令；dev server 类命令改为后台启动并返回 `url` |
 | `POST` | `/repair` | 需要 Token | 报错归因并生成修复提示词；环境类错误返回 `mode: env` + 最简方案（`force: true` 可强制出提示词） |
-| `POST` | `/open` | 需要 Token | 按项目类型打开入口：静态页直接开，长驻项目后台起服务再开 |
+| `POST` | `/open` | 需要 Token | 按项目类型打开入口：静态页直接开，长驻项目后台起服务再开（受 `allow_run` 控制） |
+| `POST` | `/stop` | 需要 Token | 停止 `.p2r/dev.pid` 记录的后台服务，以端口关闭为准 |
+| `POST` | `/rollback` | 需要 Token | 用 `.p2r/backup/last` 回滚，回滚前快照到 `pre-rollback` |
 
 ## 配置与数据路径
 
@@ -161,6 +163,13 @@ Paste2Run 具备本地写盘与执行命令能力，因此所有边界默认收�
 - **体积与格式限制**：单次请求上限 4MB，仅处理纯文本代码，不解析图片或二进制附件。
 
 ## 更新日志
+
+### v0.4.2
+- **两阶段执行**：`run_pipeline()` 按 `&&` / `;` / 换行拆链式命令，`npm install && npm run dev` 里的安装段同步跑完并确认成功，只有最后一条长驻命令才后台拉起。修掉「install 超过 25 秒就误报没抓到地址」。失败时返回 `failedStage`，报错定位到具体哪一步。
+- **一键回滚**：新增 `rollback_last()` + `POST /rollback` + 控制台 `[ ↩ ROLLBACK ]`，把 `.p2r/backup/last` 盖回去；回滚前自动把当前版本存到 `.p2r/backup/pre-rollback`，可重复回滚。
+- **服务状态可见**：`/state` 新增 `devServer: { alive, url, pid }`，控制台显示 `SERVER: ON <url>`，刷新页面也能看到。
+- **停服更可靠**：`stop_dev_server()` 改为以端口是否关闭为准，pid 失配时按端口兑底查找进程（ss / lsof / netstat）；先 SIGTERM 再 SIGKILL。
+- **落地失败不再锁死**：油猴在 `apply` 失败时清掉 `lastHash` 并退避 60 秒，用户修好环境后还能自动重落；手动点击不受退避影响。
 
 ### v0.4.1
 - **修误触发**：

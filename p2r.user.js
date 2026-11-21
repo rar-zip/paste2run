@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Paste2Run
 // @namespace    https://local.p2r
-// @version      0.4.1
+// @version      0.4.2
 // @updateURL    __P2R_ENDPOINT__/p2r.user.js
 // @downloadURL  __P2R_ENDPOINT__/p2r.user.js
 // @description  网页 AI 回复完成后，自动把 ===FILE:=== 段落落地成本地项目文件
@@ -257,6 +257,8 @@
     );
   }
 
+  let lastFailAt = 0;
+
   async function applyNode(node, opts = {}) {
     const text = textOf(node);
     if (!MARK.test(text)) {
@@ -265,6 +267,8 @@
     }
     const h = hash(text);
     if (!opts.force && get(LS.lastHash) === h) return;
+    // 失败后退避 60 秒，避免 MutationObserver 刷出一连串无效重试；手动点击不受限
+    if (!opts.force && Date.now() - lastFailAt < 60000) return;
 
     const info = await ping();
     if (!info) {
@@ -275,7 +279,6 @@
     const serverAllowRun = !!info.allow_run;
     set(LS.run, serverAllowRun ? "1" : "0");
 
-    set(LS.lastHash, h);
     toast("[P2R] APPLYING…");
     try {
       const res = await post("/apply", {
@@ -284,6 +287,7 @@
         source: location.hostname,
       });
       if (res.ok) {
+        set(LS.lastHash, h);
         const list = (res.files || []).map((f) => "  + " + f.path).slice(0, 6).join("\n");
         const more = (res.files || []).length > 6 ? `\n  …共 ${res.files.length} 个文件` : "";
         const skipNote = (res.skipped || []).length ? `\n  ! 跳过 ${res.skipped.length} 个越界/受保护路径` : "";
@@ -305,14 +309,23 @@
                 await runFailure(r);
               }
             })
-            .catch((e) => toast("[P2R] RUN ERROR: " + e.message, 4200));
+            .catch((e) => {
+              lastFailAt = Date.now();
+              toast("[P2R] RUN ERROR: " + e.message, 4200);
+            });
         }
-      } else if (res.error && res.error.indexOf("X-P2R-Token") >= 0) {
-        toast("TOKEN 不匹配，请打开 " + ENDPOINT + " 重新安装脚本", 6000);
       } else {
-        toast("APPLY FAILED: " + (res.error || "未知错误"));
+        // 落地失败不锁死内容，用户修好环境/换个目录后还能重落
+        try { localStorage.removeItem(LS.lastHash); } catch {}
+        lastFailAt = Date.now();
+        if (res.error && res.error.indexOf("X-P2R-Token") >= 0) {
+          toast("TOKEN 不匹配，请打开 " + ENDPOINT + " 重新安装脚本", 6000);
+        } else {
+          toast("APPLY FAILED: " + (res.error || "未知错误"));
+        }
       }
     } catch (e) {
+      lastFailAt = Date.now();
       toast(e.message + "，确认 Paste2Run 本地服务在跑");
     }
   }
