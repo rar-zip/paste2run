@@ -1,7 +1,7 @@
 # Paste2Run
 
 > 网页 AI 写好的代码，直接落进你本地的项目目录。
-> **v0.4.2 · Python 3.8+ · 零第三方依赖 · 黑白极简 ASCII 控制台 · MIT License**
+> **v0.4.3 · Python 3.8+ · 零第三方依赖 · 黑白极简 ASCII 控制台 · MIT License**
 
 在 ChatGPT / Claude / Gemini / DeepSeek / 腾讯元宝 / 豆包里让 AI 生成完整项目时，最耗时间的往往不是写提示词，而是把一整页带文件名的代码逐个新建、复制、粘贴、保存。**Paste2Run** 把这一步变成全自动：AI 回复结束，文件已经在你的工程目录里，可选自动执行构建命令，报错还能一键生成修复提示词。
 
@@ -126,6 +126,7 @@ Paste2Run 具备本地写盘与执行命令能力，因此所有边界默认收�
 | `python3 p2r.py serve [--port 18765]` | 仅启动本地服务，不自动打开浏览器 |
 | `python3 p2r.py apply <文件\|-> [--dir 目录] [--dry-run]` | 从文件或标准输入（`-`）手动落地文本 |
 | `python3 p2r.py doctor` | 环境自检（Python 版本、目录写权限、脚本与解析器） |
+| `python3 p2r.py open [--dir 目录]` | 按项目类型打开入口：静态页起本地服务，长驻项目后台拉起后打开 |
 | `python3 p2r.py selftest` | 运行内置单元测试（围栏截断、乱序 RUN、越界与 `.git` 拦截、IPv6 Host、覆写备份） |
 
 ### 本地 HTTP API
@@ -163,6 +164,14 @@ Paste2Run 具备本地写盘与执行命令能力，因此所有边界默认收�
 - **体积与格式限制**：单次请求上限 4MB，仅处理纯文本代码，不解析图片或二进制附件。
 
 ## 更新日志
+
+### v0.4.3
+- **纯静态项目真正能跑了**：新增 `serve_static()`，用当前解释器起内置 `http.server`，再打开 `http://127.0.0.1:809x/`。`file://` 下 ES module、`fetch`、动态 import 会被浏览器 CORS 拦，这是之前「打开了但页面是坏的」的根因。控制台新增 `[ STATIC: SERVER ]` 可切回 `FILE` 直接开文件。
+- **自动打开条件放宽**：`apply` 后只要项目是纯静态、且 `===RUN===` 不是长驻服务，就会打开；不再要求「必须没有 RUN 命令」。
+- **入口探测递归**：`detect_entry()` 除固定路径外，还会向下找 3 层内的 `index.html`，`site/pages/index.html` 这种也能认。
+- **修正误判**：`start index.html`（Windows 打开文件）不再被当成 dev server；只认 `npm/yarn/pnpm/bun start`。
+- **重开不卡冷即**：打开去重改为按入口文件 mtime，改完代码能立即重新打开；同一文件 3 秒内不重复弹窗。
+- 新增 CLI：`python3 p2r.py open [--dir 目录]`，直接看服务端会怎么打开。
 
 ### v0.4.2
 - **两阶段执行**：`run_pipeline()` 按 `&&` / `;` / 换行拆链式命令，`npm install && npm run dev` 里的安装段同步跑完并确认成功，只有最后一条长驻命令才后台拉起。修掉「install 超过 25 秒就误报没抓到地址」。失败时返回 `failedStage`，报错定位到具体哪一步。

@@ -37,7 +37,7 @@ import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.4.2"
+VERSION = "0.4.3"
 HOME = os.path.expanduser("~/.p2r")
 CONFIG = os.path.join(HOME, "config.json")
 LOG = os.path.join(HOME, "p2r.log")
@@ -68,7 +68,8 @@ def default_config():
     return {"target": DEFAULT_TARGET, "allow_run": False, "port": DEFAULT_PORT,
             "token": secrets.token_hex(16),
             "backup_mode": "last",   # last = 只保留最近一份备份，不随轮次增长
-            "auto_open": "static"}   # static = 纯静态项目落地后自动打开；always / off
+            "auto_open": "static",   # static = 纯静态项目落地后自动打开；always / off
+            "static_open": "server"}  # server = 起内置静态服务再开；file = 直接 file://
 
 
 def load_config():
@@ -103,6 +104,8 @@ def load_config():
         cfg["backup_mode"] = "last"
     if cfg.get("auto_open") not in ("static", "always", "off"):
         cfg["auto_open"] = "static"
+    if cfg.get("static_open") not in ("server", "file"):
+        cfg["static_open"] = "server"
     if dirty:
         save_config(cfg)
     return cfg
@@ -418,13 +421,28 @@ def classify_error(output, code=None):
 
 
 def detect_entry(root):
-    """找最适合直接打开的页面入口。"""
+    """找最适合直接打开的页面入口，先看约定路径，再递归找（最多 3 层）。"""
     for rel in ("index.html", "public/index.html", "src/index.html",
                 "dist/index.html", "build/index.html", "www/index.html"):
         p = os.path.join(root, rel.replace("/", os.sep))
         if os.path.isfile(p):
             return p
-    return None
+    found = []
+    try:
+        for dirpath, dirs, names in os.walk(root):
+            dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+            depth = os.path.relpath(dirpath, root).count(os.sep)
+            if depth >= 3:
+                dirs[:] = []
+            for name in names:
+                if name.lower() in ("index.html", "index.htm"):
+                    found.append((depth, os.path.join(dirpath, name)))
+    except OSError:
+        return None
+    if not found:
+        return None
+    found.sort(key=lambda item: (item[0], len(item[1])))
+    return found[0][1]
 
 
 def detect_project(root):
@@ -495,7 +513,9 @@ def detect_project(root):
 _COMMON_PORTS = (5173, 3000, 4173, 8080, 8000, 5000, 4200)
 _URL_RE = re.compile(r"https?://(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?\S*", re.I)
 _LONG_RUNNING_RE = re.compile(
-    r"(?:\bdev\b|\bserve\b|http\.server|live-server|json-server|\bpreview\b|\bstart\b|runserver|\bflask\s+run\b|\bvite\b|\bng\s+serve\b|\bnext\s+dev\b|\buvicorn\b|\bgunicorn\b)",
+    r"(?:\bdev\b|\bserve\b|http\.server|live-server|json-server|\bpreview\b|"
+    r"(?:npm|yarn|pnpm|bun)\s+(?:run\s+)?start\b|runserver|\bflask\s+run\b|\bvite\b|"
+    r"\bng\s+serve\b|\bnext\s+dev\b|\buvicorn\b|\bgunicorn\b|\bdotnet\s+run\b|\bair\b)",
     re.I)
 
 def looks_long_running(cmd):
@@ -804,6 +824,71 @@ def rollback_last(root):
             "preRollback": os.path.relpath(pre, root), "stamp": stamp}
 
 
+def serve_static(root, entry=None):
+    """用内置 http.server 起一个只读静态站。
+
+    比 file:// 靠谱：ES module、fetch、动态 import 在 file:// 下会被浏览器 CORS 拦，
+    起个本地服务就能真跑起来，而且不需要用户装任何东西（用当前解释器）。
+    """
+    directory = root
+    rel = ""
+    if entry:
+        d = os.path.dirname(os.path.abspath(entry))
+        if d and os.path.abspath(d) != os.path.abspath(root):
+            directory = d
+            rel = os.path.basename(entry)
+
+    port = None
+    for p in (8090, 8091, 8092, 8093, 8094, 8095, 8100, 8101):
+        if not _port_open(p, timeout=0.1):
+            port = p
+            break
+    if port is None:
+        return {"ok": False, "error": "8090-8101 都被占用了"}
+
+    popen_kw = {
+        "cwd": directory,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+    }
+    if os.name == "nt":
+        popen_kw["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    else:
+        popen_kw["start_new_session"] = True
+
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "http.server", str(port),
+             "--bind", "127.0.0.1", "--directory", directory],
+            **popen_kw)
+    except OSError as exc:
+        return {"ok": False, "error": "无法启动静态服务: %s" % exc}
+
+    for _ in range(25):
+        if _port_open(port, timeout=0.2):
+            break
+        time.sleep(0.12)
+
+    if not _port_open(port, timeout=0.2):
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        return {"ok": False, "error": "静态服务没起来"}
+
+    url = "http://127.0.0.1:%d/%s" % (port, rel)
+    try:
+        os.makedirs(os.path.join(root, ".p2r"), exist_ok=True)
+        with open(os.path.join(root, ".p2r", "dev.pid"), "w") as fh:
+            fh.write(str(proc.pid))
+        with open(os.path.join(root, ".p2r", "dev.url"), "w") as fh:
+            fh.write(url)
+    except OSError:
+        pass
+    log("static-server pid=%s url=%s" % (proc.pid, url))
+    return {"ok": True, "url": url, "port": port, "pid": proc.pid, "mode": "static"}
+
+
 def open_target(path_or_url):
     """跨平台打开文件或网址。"""
     raw = path_or_url
@@ -826,6 +911,28 @@ def open_target(path_or_url):
     except Exception as exc:
         return {"ok": False, "error": str(exc), "url": target}
     return {"ok": True, "url": target}
+
+
+def open_static(root, entry):
+    """纯静态项目优先起本地服务再开（ES module / fetch 在 file:// 下会挂），失败回退 file://。"""
+    if load_config().get("static_open") == "file":
+        res = open_target(entry)
+        res["mode"] = "static-file"
+        return res
+
+    srv = serve_static(root, entry)
+    if srv.get("ok") and srv.get("url"):
+        op = open_target(srv["url"])
+        return {"ok": bool(op.get("ok")), "mode": "static-server", "url": srv["url"],
+                "pid": srv.get("pid"), "manual": bool(op.get("manual")),
+                "error": op.get("error")}
+
+    # 服务起不来就退回 file://，至少能让用户看到页面
+    fb = open_target(entry)
+    fb["mode"] = "static-file"
+    fb["fallback"] = True
+    fb["serverError"] = srv.get("error")
+    return fb
 
 
 def open_project(root, allow_run=False):
@@ -853,10 +960,9 @@ def open_project(root, allow_run=False):
                 "output": res.get("output", "")[:1500], "plan": minimal_run_plan(root)}
     entry = info.get("entry")
     if entry:
-        opened = open_target(entry)
-        return {"ok": bool(opened.get("ok")), "mode": "static",
-                "url": opened.get("url"), "manual": bool(opened.get("manual")),
-                "error": opened.get("error"), "plan": minimal_run_plan(root)}
+        res = open_static(root, entry)
+        res["plan"] = minimal_run_plan(root)
+        return res
     return {"ok": False, "error": "这个项目没有可直接打开的入口，需要在终端里手动跑", "plan": minimal_run_plan(root)}
 
 
@@ -903,9 +1009,12 @@ def _running_dev_url(root):
     return None
 
 
-def _should_open(path, cooldown=10.0):
-    """同一个入口短时间内不重复弹浏览器（多轮修复时很必要）。"""
-    key = os.path.abspath(path)
+def _should_open(path, cooldown=3.0):
+    """同一个入口短时间内不重复弹浏览器；文件改过（mtime 变化）就允许重开。"""
+    try:
+        key = "%s|%.3f" % (os.path.abspath(path), os.path.getmtime(path))
+    except OSError:
+        key = os.path.abspath(path)
     now = time.time()
     if _LAST_OPEN["key"] == key and now - _LAST_OPEN["at"] < cooldown:
         return False
@@ -1188,8 +1297,9 @@ pre.tree-box { white-space: pre; word-break: normal; max-height: 220px; }
           <div class="row" style="margin-top:8px;gap:8px">
             <button class="sm" id="btn-backup-mode">[ BACKUP: LAST ]</button>
             <button class="sm" id="btn-auto-open">[ AUTO-OPEN: STATIC ]</button>
+            <button class="sm" id="btn-static-open">[ STATIC: SERVER ]</button>
           </div>
-          <div class="hint" style="margin-top:6px">BACKUP 切 LAST 只留最近一份备份，多轮修复不会把磁盘堆满；OFF 完全不备份。AUTO-OPEN 控制落地后要不要帮你打开页面。</div>
+          <div class="hint" style="margin-top:6px">BACKUP 切 LAST 只留最近一份备份，多轮修复不会把磁盘堆满；OFF 完全不备份。AUTO-OPEN 控制落地后要不要帮你打开页面。STATIC 为 SERVER 时会用内置 http.server 起本地服务再开（ES module / fetch 才跑得起来），FILE 则直接 file:// 打开。</div>
           <div class="sec-grid">
             <div class="sec-item"><span class="k">BIND</span><span class="v">127.0.0.1</span></div>
             <div class="sec-item"><span class="k">AUTH</span><span class="v">X-P2R-TOKEN</span></div>
@@ -1365,6 +1475,8 @@ echo "Paste2Run OK"`;
     if (bm) bm.textContent = "[ BACKUP: " + String(curState.backup_mode || "last").toUpperCase() + " ]";
     const ao = $("#btn-auto-open");
     if (ao) ao.textContent = "[ AUTO-OPEN: " + String(curState.auto_open || "static").toUpperCase() + " ]";
+    const so = $("#btn-static-open");
+    if (so) so.textContent = "[ STATIC: " + String(curState.static_open || "server").toUpperCase() + " ]";
   }
 
   async function cycleSetting(key, seq) {
@@ -1510,6 +1622,7 @@ echo "Paste2Run OK"`;
   $("#btn-save").addEventListener("click", () => saveConfig());
   $("#btn-backup-mode").addEventListener("click", () => cycleSetting("backup_mode", ["last", "off", "stamp"]));
   $("#btn-auto-open").addEventListener("click", () => cycleSetting("auto_open", ["static", "always", "off"]));
+  $("#btn-static-open").addEventListener("click", () => cycleSetting("static_open", ["server", "file"]));
   const onToggleRun = () => saveConfig(!curState.allow_run);
   $("#toggle-run").addEventListener("click", onToggleRun);
   $("#toggle-run").addEventListener("keydown", (e) => { if (e.key === " " || e.key === "Enter") { e.preventDefault(); onToggleRun(); } });
@@ -1797,10 +1910,12 @@ class Handler(BaseHTTPRequestHandler):
                                     "target": target, "allow_run": bool(cfg.get("allow_run")),
                                     "backup_mode": cfg.get("backup_mode"),
                                     "auto_open": cfg.get("auto_open"),
+                                    "static_open": cfg.get("static_open"),
                                     "devServer": dev, "last": last})
 
         if path == "/config":
-            pub = {k: cfg.get(k) for k in ("target", "allow_run", "backup_mode", "auto_open")}
+            pub = {k: cfg.get(k) for k in ("target", "allow_run", "backup_mode",
+                                            "auto_open", "static_open")}
             pub.update({"ok": True, "version": VERSION, "port": _CURRENT_PORT[0]})
             return self._json(200, pub)
 
@@ -1835,12 +1950,15 @@ class Handler(BaseHTTPRequestHandler):
                 cfg["backup_mode"] = body["backup_mode"]
             if body.get("auto_open") in ("static", "always", "off"):
                 cfg["auto_open"] = body["auto_open"]
+            if body.get("static_open") in ("server", "file"):
+                cfg["static_open"] = body["static_open"]
             os.makedirs(os.path.expanduser(cfg["target"]), exist_ok=True)
             save_config(cfg)
             return self._json(200, {"ok": True, "target": cfg["target"],
                                     "allow_run": cfg["allow_run"],
                                     "backup_mode": cfg["backup_mode"],
-                                    "auto_open": cfg["auto_open"]})
+                                    "auto_open": cfg["auto_open"],
+                                    "static_open": cfg["static_open"]})
 
         target = body.get("target") or cfg.get("target")
         if not target:
@@ -1930,13 +2048,17 @@ class Handler(BaseHTTPRequestHandler):
         if result.get("ok"):
             plan = minimal_run_plan(root)
             result["plan"] = plan
-            # 纯静态项目：落地即自动打开，省掉用户自己找 index.html 那一步
+            # 纯静态项目：不管有没有 ===RUN=== 都直接把页面跑起来；
+            # 只有 RUN 本身就是长驻服务时才交给 /run 处理
             if not body.get("dryRun") and cfg.get("auto_open") in ("static", "always"):
-                want = cfg.get("auto_open") == "always" or (
-                    plan.get("kind") == "static" and not result.get("run"))
                 entry = plan.get("entry")
-                if want and entry and _should_open(entry):
-                    result["open"] = open_target(entry)
+                run_cmd = result.get("run") or ""
+                want = bool(entry) and (
+                    cfg.get("auto_open") == "always"
+                    or (plan.get("kind") == "static" and not looks_long_running(run_cmd))
+                )
+                if want and _should_open(entry):
+                    result["open"] = open_static(root, entry)
         return self._json(200 if result.get("ok") else 422, result)
 
 
@@ -2022,6 +2144,7 @@ def cmd_doctor():
         print("  ✗ 目录不可写: %s" % exc)
         ok = False
     print("  自动执行: %s" % ("开" if cfg.get("allow_run") else "关"))
+    print("  自动打开: %s / 静态方式: %s" % (cfg.get("auto_open"), cfg.get("static_open")))
     print("  端口: %s" % cfg.get("port"))
     us = os.path.join(os.path.dirname(os.path.abspath(__file__)), "p2r.user.js")
     print("油猴脚本: %s" % ("✓ 找到" if os.path.exists(us) else "✗ 缺失"))
@@ -2172,6 +2295,9 @@ def main():
     sub.add_parser("doctor", help="环境自检")
     sub.add_parser("selftest", help="解析自检")
 
+    op = sub.add_parser("open", help="按项目类型打开入口（静态页起本地服务再开）")
+    op.add_argument("--dir", default=None)
+
     args = ap.parse_args()
     cmd = args.cmd or "up"
 
@@ -2183,6 +2309,12 @@ def main():
         cmd_apply(args.file, args.dir, args.dry_run)
     elif cmd == "doctor":
         sys.exit(cmd_doctor())
+    elif cmd == "open":
+        cfg = load_config()
+        root = os.path.abspath(os.path.expanduser(args.dir or cfg.get("target")))
+        out = open_project(root, allow_run=bool(cfg.get("allow_run")))
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        sys.exit(0 if out.get("ok") else 1)
     else:
         cmd_selftest()
 
