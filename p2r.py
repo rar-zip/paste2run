@@ -20,13 +20,16 @@
   npm install && npm run dev
 """
 import argparse
+from collections import deque
 import hmac
 import html
 import json
 import os
+from pathlib import Path
 import re
 import secrets
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -34,7 +37,7 @@ import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 HOME = os.path.expanduser("~/.p2r")
 CONFIG = os.path.join(HOME, "config.json")
 LOG = os.path.join(HOME, "p2r.log")
@@ -351,7 +354,7 @@ _ENV_RULES = (
      "运行环境缺失"),
     (re.compile(r"EADDRINUSE|address already in use|端口.{0,8}被占用", re.I), "端口被占用"),
     (re.compile(r"EACCES|Permission denied", re.I), "权限不足"),
-    (re.compile(r"(?:Could not resolve host|getaddrinfo ENOTFOUND|ETIMEDOUT|EAI_AGAIN|ECONNREFUSED|network)", re.I),
+    (re.compile(r"(?:Could not resolve host|getaddrinfo ENOTFOUND|ETIMEDOUT|EAI_AGAIN|ECONNREFUSED|ENETUNREACH|ECONNRESET|ERR_NETWORK|socket hang up|network\s+(?:error|timeout|unreachable|failed))", re.I),
      "网络不可达，依赖下载失败"),
     (re.compile(r"npm ERR! code (?:E404|EAI_AGAIN|ETIMEDOUT|ECONNREFUSED|ENOTFOUND|EACCES)", re.I),
      "npm 拉包失败"),
@@ -492,17 +495,18 @@ def detect_project(root):
 _COMMON_PORTS = (5173, 3000, 4173, 8080, 8000, 5000, 4200)
 _URL_RE = re.compile(r"https?://(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?\S*", re.I)
 _LONG_RUNNING_RE = re.compile(
-    r"(?:\bdev\b|\bserve\b|\bserve\w*\b|\bpreview\b|\bstart\b|runserver|\bflask\s+run\b|\bvite\b|\bng\s+serve\b|\bnext\s+dev\b)",
+    r"(?:\bdev\b|\bserve\b|http\.server|live-server|json-server|\bpreview\b|\bstart\b|runserver|\bflask\s+run\b|\bvite\b|\bng\s+serve\b|\bnext\s+dev\b|\buvicorn\b|\bgunicorn\b)",
     re.I)
 
 def looks_long_running(cmd):
-    """dev server 类命令不适合同步等待，要改成后台起。"""
+    """dev server 类命令不适合同步等待，要改成后台起；链式命令以最后一段为准。"""
     if not cmd:
         return False
-    low = cmd.lower()
-    if any(k in low for k in ("build", "install", "test", "lint")) and "dev" not in low:
+    parts = [p.strip() for p in re.split(r"&&|;|\n", cmd) if p.strip()]
+    tail = (parts[-1] if parts else cmd).lower()
+    if any(k in tail for k in ("build", "install", "test", "lint")) and not re.search(r"\b(dev|serve|start|preview)\b", tail):
         return False
-    return bool(_LONG_RUNNING_RE.search(low))
+    return bool(_LONG_RUNNING_RE.search(tail))
 
 
 def _is_entry_cmd(cmd, plan):
@@ -526,22 +530,62 @@ def _port_open(port, host="127.0.0.1", timeout=0.6):
         return False
 
 
+def stop_dev_server(root):
+    """停止该项目记录在 .p2r/dev.pid 的后台服务。"""
+    pidf = os.path.join(root, ".p2r", "dev.pid")
+    urlf = os.path.join(root, ".p2r", "dev.url")
+    if not os.path.isfile(pidf):
+        return {"ok": False, "error": "没有正在运行的后台服务记录"}
+    try:
+        pid = int(open(pidf, encoding="utf-8").read().strip())
+    except Exception:
+        pid = None
+    stopped = False
+    if pid:
+        try:
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+            else:
+                os.killpg(os.getpgid(pid), signal.SIGTERM)
+            stopped = True
+        except Exception:
+            try:
+                os.kill(pid, signal.SIGTERM)
+                stopped = True
+            except Exception:
+                pass
+    for fp in (pidf, urlf):
+        try:
+            os.remove(fp)
+        except OSError:
+            pass
+    log("dev-server stop pid=%s stopped=%s" % (pid, stopped))
+    return {"ok": True, "pid": pid, "stopped": stopped}
+
+
 def start_dev_server(root, cmd, wait=25):
     """后台起 dev server，尽量抓到它监听的地址，然后返回给前端打开。"""
     for pat in BLOCKED_PATTERNS:
         if pat.search((cmd or "").lower()):
             return {"ok": False, "error": "命令里包含危险操作，已拒绝"}
+    # 启动前先快照已占用端口，避免把本机无关服务误认成刚起的项目
+    pre_open = {p for p in _COMMON_PORTS if _port_open(p, timeout=0.15)}
+    popen_kw = {
+        "shell": True, "cwd": root,
+        "stdout": subprocess.PIPE, "stderr": subprocess.STDOUT,
+        "env": {**os.environ, "CI": "1", "NO_COLOR": "1", "BROWSER": "none"},
+    }
+    if os.name == "nt":
+        popen_kw["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    else:
+        popen_kw["start_new_session"] = True
     try:
-        proc = subprocess.Popen(
-            cmd, shell=True, cwd=root,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            env={**os.environ, "CI": "1", "NO_COLOR": "1", "BROWSER": "none"},
-            start_new_session=True,
-        )
+        proc = subprocess.Popen(cmd, **popen_kw)
     except OSError as exc:
         return {"ok": False, "error": "无法执行: %s" % exc}
 
-    buf = []
+    buf = deque(maxlen=400)
 
     def reader():
         try:
@@ -566,12 +610,11 @@ def start_dev_server(root, cmd, wait=25):
         time.sleep(0.4)
 
     if not url:
-        # 只在进程还活着时才按常见端口兑底；进程已经退出就不能乱猜，
-        # 否则会错把本机别的服务（比如 8080）当成刚起的项目
+        # 只认本次新监听的端口，避免劫持本机已运行的无关服务
         exited = proc.poll() is not None
         if not exited:
             for port in _COMMON_PORTS:
-                if _port_open(port):
+                if port not in pre_open and _port_open(port):
                     url = "http://127.0.0.1:%d/" % port
                     break
 
@@ -600,14 +643,14 @@ def start_dev_server(root, cmd, wait=25):
 
 def open_target(path_or_url):
     """跨平台打开文件或网址。"""
-    target = path_or_url
-    if not target:
+    raw = path_or_url
+    if not raw:
         return {"ok": False, "error": "没有可打开的目标"}
-    if not target.startswith(("http://", "https://", "file://")):
-        target = "file://" + os.path.abspath(target).replace(os.sep, "/")
+    is_url = raw.startswith(("http://", "https://", "file://"))
+    target = raw if is_url else Path(os.path.abspath(raw)).as_uri()
     try:
         if os.name == "nt":
-            os.startfile(target)  # type: ignore[attr-defined]
+            os.startfile(raw if not is_url else target)  # type: ignore[attr-defined]
         elif sys.platform == "darwin":
             subprocess.Popen(["open", target])
         else:
@@ -622,8 +665,8 @@ def open_target(path_or_url):
     return {"ok": True, "url": target}
 
 
-def open_project(root):
-    """按项目类型决定：静态页直接开，需要服务的就先后台起再开。"""
+def open_project(root, allow_run=False):
+    """按项目类型决定：静态页直接开，需要服务的须在 allow_run 开启时才后台拉起。"""
     info = detect_project(root)
     if info.get("long_running") and info.get("commands"):
         # 已经在跑就直接打开，不要重复拉起端口冲突的第二个实例
@@ -631,21 +674,27 @@ def open_project(root):
         if running:
             opened = open_target(running)
             return {"ok": True, "mode": "server", "url": running,
-                    "opened": opened, "reused": True}
-        cmd = info["commands"][-1]
+                    "opened": opened, "manual": bool(opened.get("manual")), "reused": True}
+        if not allow_run:
+            return {"ok": False, "mode": "server", "blocked": True,
+                    "error": "该项目需启动本地服务，请先开启「自动执行 ===RUN===」或按下方方案手动运行",
+                    "plan": minimal_run_plan(root)}
+        cmd = " && ".join(info["commands"])
         res = start_dev_server(root, cmd)
         if res.get("url"):
             opened = open_target(res["url"])
             return {"ok": True, "mode": "server", "url": res["url"],
-                    "opened": opened, "output": res.get("output", "")[:1500]}
+                    "opened": opened, "manual": bool(opened.get("manual")),
+                    "output": res.get("output", "")[:1500]}
         return {"ok": False, "mode": "server", "error": "服务没起来，没抓到地址",
-                "output": res.get("output", "")[:1500], "plan": info}
+                "output": res.get("output", "")[:1500], "plan": minimal_run_plan(root)}
     entry = info.get("entry")
     if entry:
         opened = open_target(entry)
         return {"ok": bool(opened.get("ok")), "mode": "static",
-                "url": opened.get("url"), "error": opened.get("error"), "plan": info}
-    return {"ok": False, "error": "这个项目没有可直接打开的入口，需要在终端里手动跑", "plan": info}
+                "url": opened.get("url"), "manual": bool(opened.get("manual")),
+                "error": opened.get("error"), "plan": minimal_run_plan(root)}
+    return {"ok": False, "error": "这个项目没有可直接打开的入口，需要在终端里手动跑", "plan": minimal_run_plan(root)}
 
 
 def minimal_run_plan(root):
@@ -1047,6 +1096,7 @@ pre.tree-box { white-space: pre; word-break: normal; max-height: 220px; }
           <div id="recent-wrap"><div style="color:var(--fg-dim)">还没有落地记录</div></div>
           <div class="row" style="margin:10px 0 4px">
             <button class="sm" id="btn-open-project">[ ◎ OPEN PROJECT ]</button>
+            <button class="sm" id="btn-stop-server">[ ■ STOP SERVER ]</button>
           </div>
           <div class="hint" style="margin-bottom:10px">静态页直接开；带 dev server 的项目会后台起服务再开，不用自己去目录里点 index.html。</div>
           <div class="run-box" id="run-panel" style="display:none">
@@ -1310,12 +1360,23 @@ echo "Paste2Run OK"`;
       const r = await fetch("/open", { method: "POST", headers: H(), body: JSON.stringify({}) });
       const j = await r.json();
       if (j.ok) {
-        out.textContent = `[OPENED] ${j.mode} -> ${j.url || ""}`;
-        toast("已打开 " + (j.url || ""));
+        out.textContent = (j.manual ? "[MANUAL OPEN] " : "[OPENED] ") + `${j.mode} -> ${j.url || ""}`;
+        toast(j.manual ? "请手动打开 " + (j.url || "") : "已打开 " + (j.url || ""));
       } else {
-        out.textContent = `[ERR] ${j.error || "打开失败"}\n` + ((j.plan && j.plan.text) || (j.output || ""));
+        out.textContent = `[ERR] ${j.error || "打开失败"}\n` + (j.url ? `URL: ${j.url}\n` : "") + ((j.plan && j.plan.text) || (j.output || ""));
         toast("打开失败");
       }
+    } catch (e) { out.textContent = "[ERR] 请求失败"; }
+  });
+
+  $("#btn-stop-server").addEventListener("click", async () => {
+    const out = $("#run-output");
+    out.style.display = "block";
+    try {
+      const r = await fetch("/stop", { method: "POST", headers: H(), body: JSON.stringify({}) });
+      const j = await r.json();
+      out.textContent = j.ok ? `[STOPPED] pid=${j.pid || "-"}` : `[ERR] ${j.error || "停止失败"}`;
+      toast(j.ok ? "后台服务已停止" : (j.error || "没有运行中的服务"));
     } catch (e) { out.textContent = "[ERR] 请求失败"; }
   });
 
@@ -1538,7 +1599,7 @@ class Handler(BaseHTTPRequestHandler):
                                     "auto_open": cfg.get("auto_open"), "last": last})
 
         if path == "/config":
-            pub = {k: cfg.get(k) for k in ("target", "allow_run")}
+            pub = {k: cfg.get(k) for k in ("target", "allow_run", "backup_mode", "auto_open")}
             pub.update({"ok": True, "version": VERSION, "port": _CURRENT_PORT[0]})
             return self._json(200, pub)
 
@@ -1586,9 +1647,15 @@ class Handler(BaseHTTPRequestHandler):
         root = os.path.abspath(os.path.expanduser(target))
 
         if path == "/open":
-            res = open_project(root)
+            res = open_project(root, allow_run=bool(cfg.get("allow_run")))
             res["target"] = root
-            return self._json(200 if res.get("ok") else 422, res)
+            code = 200 if res.get("ok") else (403 if res.get("blocked") else 422)
+            return self._json(code, res)
+
+        if path == "/stop":
+            res = stop_dev_server(root)
+            res["target"] = root
+            return self._json(200 if res.get("ok") else 404, res)
 
         if path == "/run" or path == "/repair":
             if path == "/repair":
@@ -1845,7 +1912,11 @@ npm install && npm run dev
             info2 = detect_project(tmp2)
             assert info2["kind"] == "node" and any("npm run dev" in c for c in info2["commands"]), info2
             assert looks_long_running("npm run dev") is True
+            assert looks_long_running("npm install && npm run start") is True
+            assert looks_long_running("npm install && npm run serve") is True
             assert looks_long_running("npm install && npm run build") is False
+            assert looks_long_running("cp server.py dist/") is False
+            assert classify_error("ReferenceError: networkConfig is not defined", 1)["class"] == "file"
 
         # 只有 .py 没有标准入口的分支不能崩
         with tempfile.TemporaryDirectory() as tmp3:

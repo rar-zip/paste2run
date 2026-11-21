@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Paste2Run
 // @namespace    https://local.p2r
-// @version      0.4.0
+// @version      0.4.1
 // @updateURL    __P2R_ENDPOINT__/p2r.user.js
 // @downloadURL  __P2R_ENDPOINT__/p2r.user.js
 // @description  网页 AI 回复完成后，自动把 ===FILE:=== 段落落地成本地项目文件
@@ -76,7 +76,9 @@
     '[class*="markdown"]',
   ];
 
-  const MARK = /===\s*FILE:/;
+  // 必须匹配独立行头的 ===FILE: ...===，避免把用户自己粘贴的提示词误判成 AI 代码回复
+  const MARK = /^[ \t]*(?:\*\*)?===\s*FILE:\s*[^\r\n]+?===/m;
+  const IGNORE_CLOSEST = '[data-message-author-role="user"], [data-testid="user-message"], textarea, input, [contenteditable="true"], #p2r-toast';
 
   const textOf = (el) => (el ? (el.innerText || el.textContent || "").trim() : "");
 
@@ -89,6 +91,7 @@
     const seen = new Set();
     const push = (el) => {
       if (!el || seen.has(el)) return;
+      if (el.closest && el.closest(IGNORE_CLOSEST)) return;
       const t = textOf(el);
       if (!t || !MARK.test(t)) return;
       seen.add(el);
@@ -119,7 +122,7 @@
       while (walker.nextNode() && hits < 24) {
         hits++;
         const leaf = walker.currentNode.parentElement;
-        if (!leaf) continue;
+        if (!leaf || (leaf.closest && leaf.closest(IGNORE_CLOSEST))) continue;
         const baseLen = textOf(leaf).length || 1;
         let el = leaf;
         for (let i = 0; i < 8 && el.parentElement; i++) {
@@ -256,7 +259,7 @@
 
   async function applyNode(node, opts = {}) {
     const text = textOf(node);
-    if (!text.includes("===FILE:")) {
+    if (!MARK.test(text)) {
       if (!opts.silent) toast("这段回复里没有 ===FILE: 标记");
       return;
     }
@@ -333,7 +336,7 @@
         clearTimeout(timer);
         timer = setTimeout(() => {
           const now = textOf(node);
-          if (now === lastText && now.includes("===FILE:")) applyNode(node, { silent: true });
+          if (now === lastText && MARK.test(now)) applyNode(node, { silent: true });
         }, 1400);
       }, 300);
     });

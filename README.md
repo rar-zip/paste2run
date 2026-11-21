@@ -1,7 +1,7 @@
 # Paste2Run
 
 > 网页 AI 写好的代码，直接落进你本地的项目目录。
-> **v0.4.0 · Python 3.8+ · 零第三方依赖 · 黑白极简 ASCII 控制台 · MIT License**
+> **v0.4.1 · Python 3.8+ · 零第三方依赖 · 黑白极简 ASCII 控制台 · MIT License**
 
 在 ChatGPT / Claude / Gemini / DeepSeek / 腾讯元宝 / 豆包里让 AI 生成完整项目时，最耗时间的往往不是写提示词，而是把一整页带文件名的代码逐个新建、复制、粘贴、保存。**Paste2Run** 把这一步变成全自动：AI 回复结束，文件已经在你的工程目录里，可选自动执行构建命令，报错还能一键生成修复提示词。
 
@@ -157,10 +157,20 @@ Paste2Run 具备本地写盘与执行命令能力，因此所有边界默认收�
 - **脚本提示“连不上本地服务”**：确认本地服务正在运行；若默认端口 `18765` 被占用，服务会自动向后顺延寻找可用端口（最多尝试 10 个），请在启动窗口查看实际端口。
 - **提示“TOKEN 不匹配”**：重置过 `~/.p2r/config.json` 或更换端口后，回到控制台重新点一次 **`[ ↓ INSTALL / UPDATE p2r.user.js ]`** 覆盖安装即可。
 - **极慢流式模型提前触发落地**：自动落地依赖“文本停止变化 1.4 秒”判定，若模型卡顿超过 1.4 秒，等生成完毕后点左下角 **`[ P2R: APPLY ]`** 补落一次即可。
-- **长驻开发服务器超时**：`===RUN===` 为同步执行（超时 300 秒），建议只放安装与构建命令（如 `npm install && npm run build`），`dev server` 建议在独立终端启动。
+- **长驻开发服务器判定**：`===RUN===` 中命中 `dev`/`serve`/`vite`/`start`/`uvicorn` 等长驻命令时会自动改为后台拉起并抓取监听地址，可通过控制台 `[ ■ STOP SERVER ]` 或 `POST /stop` 停止。
 - **体积与格式限制**：单次请求上限 4MB，仅处理纯文本代码，不解析图片或二进制附件。
 
 ## 更新日志
+
+### v0.4.1
+- **修误触发**：
+  `===FILE:` 改为必须匹配独立行头（`^===FILE: xxx===`），并把用户消息、输入框、`contenteditable`、toast 列入忽略区，避免把自己粘贴的协议提示词当成 AI 回复落地。
+- **链式命令判定修正**：`looks_long_running()` 改为只看 `&&` / `;` / 换行后的最后一段，`npm install && npm run start`、`npm install && npm run serve` 正确识别为长驻，`cp server.py dist/` 不再误判。
+- **新增 /stop 与 STOP SERVER**：`stop_dev_server()` 按 `.p2r/dev.pid` 停止后台服务（Windows 用 `taskkill /F /T`，POSIX 用 `killpg`），控制台多一个 `[ ■ STOP SERVER ]` 按钮。
+- **端口兑底更严**：起服务前先快照已占用端口，只认本次新监听的端口，不再把本机无关服务当成本次项目。
+- **/open 安全门禁**：未开启 `allow_run` 时不会后台拉起命令，返回 403 + 最简运行方案；纯静态页仍然直接打开。
+- **文件 URI 修正**：改用 `Path.as_uri()`，中文与空格路径不再拼错。
+- 网络错误规则补齐 `ENETUNREACH` / `ECONNRESET` / `ERR_NETWORK` / `socket hang up`；长驻命令识别补 `http.server` / `uvicorn` / `gunicorn` / `live-server` / `json-server`。
 
 ### v0.4.0
 - **报错归因**：新增 `classify_error()`，把失败分成 `env`（环境/脚本问题）与 `file`（代码问题）。环境类不再把烂报错甩给 AI 乱改，直接给出最简运行方案并复制到剪贴板。
