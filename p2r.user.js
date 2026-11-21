@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Paste2Run
 // @namespace    https://local.p2r
-// @version      0.3.1
+// @version      0.4.0
 // @updateURL    __P2R_ENDPOINT__/p2r.user.js
 // @downloadURL  __P2R_ENDPOINT__/p2r.user.js
 // @description  网页 AI 回复完成后，自动把 ===FILE:=== 段落落地成本地项目文件
@@ -9,9 +9,30 @@
 // @match        https://chat.openai.com/*
 // @match        https://claude.ai/*
 // @match        https://gemini.google.com/*
+// @match        https://aistudio.google.com/*
 // @match        https://chat.deepseek.com/*
 // @match        https://yuanbao.tencent.com/*
 // @match        https://www.doubao.com/*
+// @match        https://lmarena.ai/*
+// @match        https://chat.lmsys.org/*
+// @match        https://arena.lmsys.org/*
+// @match        https://copilot.microsoft.com/*
+// @match        https://kimi.moonshot.cn/*
+// @match        https://www.kimi.com/*
+// @match        https://chatglm.cn/*
+// @match        https://chat.z.ai/*
+// @match        https://tongyi.aliyun.com/*
+// @match        https://www.tongyi.com/*
+// @match        https://yiyan.baidu.com/*
+// @match        https://chat.qwen.ai/*
+// @match        https://poe.com/*
+// @match        https://grok.com/*
+// @match        https://www.perplexity.ai/*
+// @match        https://chat.mistral.ai/*
+// @match        https://openrouter.ai/chat*
+// @match        https://huggingface.co/chat/*
+// @match        https://chat.minimax.io/*
+// @match        https://hailuoai.com/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_registerMenuCommand
 // @grant        GM_notification
@@ -39,24 +60,99 @@
   const autoOn = () => get(LS.auto, "1") === "1";
   const dryOn = () => get(LS.dry, "0") === "1";
 
-  // 各站点助手消息选择器，按优先级尝试
+  // 站点选择器只是「候选来源」，真正的判定靠内容（见 findTarget）
   const SELECTORS = [
     '[data-message-author-role="assistant"]',
     '[data-testid="assistant-message"]',
+    '[data-testid="conversation-turn"]',
     ".font-claude-message",
-    '[data-is-streaming="false"]',
     ".ds-markdown",
     "message-content",
     ".model-response-text",
+    "model-response",
+    ".chat-message",
+    ".message-content",
+    '[class*="assistant"]',
     '[class*="markdown"]',
   ];
 
-  function lastAssistantNode() {
+  const MARK = /===\s*FILE:/;
+
+  const textOf = (el) => (el ? (el.innerText || el.textContent || "").trim() : "");
+
+  /**
+   * 内容优先定位：先按站点选择器收候选，再用 DOM 文本兜底。
+   * 这样即使某个站点整体改版、选择器全失效，只要页面上出现 ===FILE: 就还能认出来。
+   */
+  function findTarget() {
+    const cands = [];
+    const seen = new Set();
+    const push = (el) => {
+      if (!el || seen.has(el)) return;
+      const t = textOf(el);
+      if (!t || !MARK.test(t)) return;
+      seen.add(el);
+      cands.push(el);
+    };
+
     for (const sel of SELECTORS) {
-      const nodes = document.querySelectorAll(sel);
-      if (nodes.length) return nodes[nodes.length - 1];
+      let nodes;
+      try {
+        nodes = document.querySelectorAll(sel);
+      } catch {
+        continue;
+      }
+      const start = Math.max(0, nodes.length - 3);
+      for (let i = start; i < nodes.length; i++) push(nodes[i]);
     }
-    return null;
+
+    // 兜底：直接找文本里带 ===FILE: 的节点，向上收拢到「装得下整段」的容器
+    try {
+      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
+        acceptNode(n) {
+          return MARK.test(n.nodeValue || "")
+            ? NodeFilter.FILTER_ACCEPT
+            : NodeFilter.FILTER_SKIP;
+        },
+      });
+      let hits = 0;
+      while (walker.nextNode() && hits < 24) {
+        hits++;
+        const leaf = walker.currentNode.parentElement;
+        if (!leaf) continue;
+        const baseLen = textOf(leaf).length || 1;
+        let el = leaf;
+        for (let i = 0; i < 8 && el.parentElement; i++) {
+          const parent = el.parentElement;
+          if (parent === document.body) break;
+          const pt = textOf(parent);
+          if (!MARK.test(pt)) break;
+          if (pt.length > baseLen * 8 + 2000) break;
+          el = parent;
+        }
+        push(el);
+      }
+    } catch {
+      /* 某些页面会禁用 TreeWalker，忽略 */
+    }
+
+    if (!cands.length) return null;
+
+    // 打分：标记数量是主信号，文本长度辅助，越靠后的消息优先
+    let best = null;
+    let bestScore = -1;
+    cands.forEach((el, idx) => {
+      const t = textOf(el);
+      const marks = (t.match(/===\s*FILE:/g) || []).length;
+      const hasRun = /===\s*RUN\s*===/.test(t);
+      let score = marks * 1000 + Math.min(t.length, 40000) / 50 + idx;
+      if (hasRun) score += 200;
+      if (score > bestScore) {
+        bestScore = score;
+        best = el;
+      }
+    });
+    return best;
   }
 
   function toast(text, ms = 2800) {
@@ -119,8 +215,47 @@
     return String(h) + ":" + s.length;
   }
 
+  function clip(text) {
+    try { GM_setClipboard(text || "", "text"); return true; } catch { return false; }
+  }
+
+  async function runFailure(r) {
+    const cls = r.class || "unknown";
+    let rep = null;
+    try {
+      rep = await post("/repair", {
+        output: r.output || "",
+        code: r.code,
+        force: cls === "file",
+      }, 20000);
+    } catch (e) {
+      return toast("[P2R] RUN FAILED: " + e.message, 5000);
+    }
+
+    if (rep && rep.mode === "env") {
+      // 环境问题：不让 AI 瞎改代码，直接把最简运行方案交给用户
+      clip((rep.plan && rep.plan.text) || "");
+      const why = (rep.reasons || []).slice(0, 2).join("；");
+      toast(
+        "[P2R] 不是代码问题，是本机环境跑不起来\n" +
+          (why || rep.hint || "") + "\n" +
+          "最简运行方案已复制到剪贴板",
+        9000
+      );
+      return;
+    }
+
+    clip(rep && rep.prompt ? rep.prompt : "");
+    const tail = (r.output || "").split("\n").filter(Boolean).slice(-1)[0] || "";
+    toast(
+      (cls === "unknown" ? "[P2R] 判断不了是哪类问题，让 AI 先自查\n" : "[P2R] 代码有问题 -> 修复提示词已复制\n") +
+        tail.slice(0, 130),
+      7000
+    );
+  }
+
   async function applyNode(node, opts = {}) {
-    const text = (node.innerText || node.textContent || "").trim();
+    const text = textOf(node);
     if (!text.includes("===FILE:")) {
       if (!opts.silent) toast("这段回复里没有 ===FILE: 标记");
       return;
@@ -128,7 +263,6 @@
     const h = hash(text);
     if (!opts.force && get(LS.lastHash) === h) return;
 
-    // 实时同步服务端最新 target 与 allow_run，避免多标签页配置漂移
     const info = await ping();
     if (!info) {
       toast("连不上本地服务，请确认 Paste2Run 正在运行");
@@ -150,7 +284,8 @@
         const list = (res.files || []).map((f) => "  + " + f.path).slice(0, 6).join("\n");
         const more = (res.files || []).length > 6 ? `\n  …共 ${res.files.length} 个文件` : "";
         const skipNote = (res.skipped || []).length ? `\n  ! 跳过 ${res.skipped.length} 个越界/受保护路径` : "";
-        toast(`WRITTEN ${res.files.length} FILE(S)${dryOn() ? " [DRY-RUN]" : ""}\n${list}${more}${skipNote}`, 4200);
+        const openNote = res.open && res.open.ok && res.open.url ? `\n  > 已打开 ${res.open.url}` : "";
+        toast(`WRITTEN ${res.files.length} FILE(S)${dryOn() ? " [DRY-RUN]" : ""}\n${list}${more}${skipNote}${openNote}`, 4200);
         if (GM_notification) {
           GM_notification({ text: `Paste2Run 写入 ${res.files.length} 个文件`, timeout: 3000 });
         }
@@ -159,14 +294,12 @@
           post("/run", {}, 300000)
             .then(async (r) => {
               if (r.ok) {
-                toast(`[P2R] RUN OK (${r.duration}s)`);
+                const where = r.url ? ` -> ${r.url}` : "";
+                toast(`[P2R] RUN OK (${r.duration ?? "?"}s)${where}`, 5000);
               } else if (r.error) {
                 toast("[P2R] RUN BLOCKED: " + r.error, 4200);
               } else {
-                const rep = await post("/repair", { output: r.output || "" });
-                GM_setClipboard(rep.prompt || "", "text");
-                const first = (r.output || "").split("\n").filter(Boolean).slice(-1)[0] || "";
-                toast("[P2R] RUN FAILED -> 修复提示词已复制\n" + first.slice(0, 120), 6000);
+                await runFailure(r);
               }
             })
             .catch((e) => toast("[P2R] RUN ERROR: " + e.message, 4200));
@@ -183,20 +316,26 @@
 
   let timer = null;
   let lastText = "";
+  let scanPending = false;
 
   function watch() {
     const mo = new MutationObserver(() => {
-      if (!autoOn()) return;
-      const node = lastAssistantNode();
-      if (!node) return;
-      const t = (node.innerText || "").trim();
-      if (!t || t === lastText) return;
-      lastText = t;
-      clearTimeout(timer);
-      timer = setTimeout(() => {
-        const now = (node.innerText || "").trim();
-        if (now === lastText && now.includes("===FILE:")) applyNode(node, { silent: true });
-      }, 1400);
+      if (!autoOn() || scanPending) return;
+      scanPending = true;
+      // 节流：流式输出时回调非常密集，300ms 合并一次
+      setTimeout(() => {
+        scanPending = false;
+        const node = findTarget();
+        if (!node) return;
+        const t = textOf(node);
+        if (!t || t === lastText) return;
+        lastText = t;
+        clearTimeout(timer);
+        timer = setTimeout(() => {
+          const now = textOf(node);
+          if (now === lastText && now.includes("===FILE:")) applyNode(node, { silent: true });
+        }, 1400);
+      }, 300);
     });
     mo.observe(document.body, { childList: true, subtree: true, characterData: true });
   }
@@ -238,16 +377,30 @@
   });
 
   GM_registerMenuCommand("手动落地最后一条回复", () => {
-    const node = lastAssistantNode();
-    if (!node) return toast("没找到助手消息");
+    const node = findTarget();
+    if (!node) return toast("没找到带 ===FILE: 的回复");
     applyNode(node, { force: true });
+  });
+
+  // 新：不用去目录里找 index.html，直接让服务端按项目类型打开
+  GM_registerMenuCommand("打开项目入口（浏览器）", async () => {
+    try {
+      const r = await post("/open", {}, 60000);
+      if (r.ok) toast("已打开 " + (r.url || ""), 4000);
+      else {
+        const plan = r.plan && r.plan.text ? "\n" + r.plan.text : "";
+        toast("打开失败：" + (r.error || "") + plan, 7000);
+      }
+    } catch (e) {
+      toast(e.message);
+    }
   });
 
   // 左下角黑白极简 ASCII 悬浮按钮
   function mountButton() {
     const b = document.createElement("button");
     b.textContent = "[ P2R: APPLY ]";
-    b.title = "Paste2Run：把最后一条回复写成文件";
+    b.title = "Paste2Run：把最后一条回复写成文件（Shift+点击 = 打开项目）";
     b.style.cssText = [
       "position:fixed", "left:16px", "bottom:16px", "z-index:2147483647",
       "padding:7px 12px", "border-radius:0", "border:1px solid #f2f2f2",
@@ -258,9 +411,17 @@
     ].join(";");
     b.onmouseenter = () => { b.style.opacity = "1"; b.style.background = "#f2f2f2"; b.style.color = "#070707"; };
     b.onmouseleave = () => { b.style.opacity = ".65"; b.style.background = "#070707"; b.style.color = "#f2f2f2"; };
-    b.onclick = () => {
-      const node = lastAssistantNode();
-      if (!node) return toast("没找到助手消息");
+    b.onclick = async (ev) => {
+      if (ev.shiftKey) {
+        try {
+          const r = await post("/open", {}, 60000);
+          if (r.ok) toast("已打开 " + (r.url || ""), 4000);
+          else toast("打开失败：" + (r.error || ""), 5000);
+        } catch (e) { toast(e.message); }
+        return;
+      }
+      const node = findTarget();
+      if (!node) return toast("没找到带 ===FILE: 的回复");
       applyNode(node, { force: true });
     };
     document.body.appendChild(b);

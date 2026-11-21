@@ -1,7 +1,7 @@
 # Paste2Run
 
 > 网页 AI 写好的代码，直接落进你本地的项目目录。
-> **v0.3.1 · Python 3.8+ · 零第三方依赖 · 黑白极简 ASCII 控制台 · MIT License**
+> **v0.4.0 · Python 3.8+ · 零第三方依赖 · 黑白极简 ASCII 控制台 · MIT License**
 
 在 ChatGPT / Claude / Gemini / DeepSeek / 腾讯元宝 / 豆包里让 AI 生成完整项目时，最耗时间的往往不是写提示词，而是把一整页带文件名的代码逐个新建、复制、粘贴、保存。**Paste2Run** 把这一步变成全自动：AI 回复结束，文件已经在你的工程目录里，可选自动执行构建命令，报错还能一键生成修复提示词。
 
@@ -23,6 +23,10 @@
 ## 核心特性
 
 - **零依赖单文件服务**：仅需系统自带 Python 3.8+，无需 `pip install`，一个 `p2r.py` + 一个 `p2r.user.js` 即可运行。
+- **报错归因**：RUN 失败会先判断是「文件写错了」还是「本机环境跑不起来」。前者生成修复提示词让 AI 改文件，后者不折腾 AI，直接给出最简运行方案（v0.4.0）。
+- **落地即打开**：纯静态项目写完自动打开 `index.html`；带 dev server 的项目后台起服务、抓到监听地址后自动开浏览器，不用自己翻目录（v0.4.0）。
+- **备份不膨胀**：默认 `BACKUP: LAST`，多轮修复只保留最近一份快照，磁盘占用恒定（v0.4.0）。
+- **内容优先的站点适配**：站点选择器只当候选来源，真正的判定看页面里有没有 `===FILE:`，站点改版也不会直接失效（v0.4.0）。
 - **黑白极简 ASCII 控制台**：启动后自动打开本地控制台，支持深黑 / 纸白一键反色切换、三套 Prompt 协议切换（标准 / 严格 / 增量补丁）、网页端直接粘贴 Dry-Run 试运行与落盘、实时 ASCII 目录树与手动执行 `===RUN===`。
 - **智能容错解析**：自动剥离 Markdown 代码块围栏（`` ```lang ``），自动截断闭合围栏后的 AI 闲聊结语，兼容加粗标记与乱序 `===RUN===` 段落。
 - **默认安全收敛**：仅监听 `127.0.0.1`、强校验 `X-P2R-Token` / `Host` / `Origin`、拒绝越界与 `.git` / `.p2r` 写入、覆写前强制备份、命令执行默认关闭。
@@ -91,9 +95,11 @@ npm install && npm run build
 
 ## 支持的网页 AI 站点
 
-默认适配 **ChatGPT**、**Claude**、**Gemini**、**DeepSeek**、**腾讯元宝**、**豆包**。
+默认适配 **ChatGPT**、**Claude**、**Gemini**、**AI Studio**、**DeepSeek**、**LMArena（lmarena.ai / lmsys）**、**Kimi**、**通义 / Qwen**、**智谱 / Z.ai**、**文心一言**、**腾讯元宝**、**豆包**、**Copilot**、**Poe**、**Grok**、**Perplexity**、**Mistral**、**OpenRouter Chat**、**HuggingFace Chat**、**MiniMax**、**海螺**，共 28 条 `@match`。
 
-各站点 DOM 选择器维护在 `p2r.user.js` 的 `SELECTORS` 数组中并按优先级依次匹配。如果某个站点改版或你需要新增平台，在 `SELECTORS` 中追加一条 CSS 选择器并在头部补充 `@match`，回到控制台重新点击安装脚本即可生效。
+各站点 DOM 选择器维护在 `p2r.user.js` 的 `SELECTORS` 数组中。**但适配不再依赖选择器**：脚本会兜底扫描页面文本，任何含 `===FILE:` 的元素都会被识别，因此站点改版、或者遇到没收录的新站，只要内容格式对就还能落地。
+
+控制台里还提供 **ALL-SITES 宽松版**（`/p2r.user.js?all=1`），注入所有站点，靠内容判定是否动作。
 
 ## 安全设计
 
@@ -133,8 +139,9 @@ Paste2Run 具备本地写盘与执行命令能力，因此所有边界默认收�
 | `GET` | `/tree` | 无需 Token | 返回当前目标目录的 ASCII 目录树 |
 | `POST` | `/config` | 需要 Token | 更新 `target` 与 `allow_run` 配置 |
 | `POST` | `/apply` | 需要 Token | 解析并写入文件，支持 `{ text, target?, dryRun?, source? }` |
-| `POST` | `/run` | 需要 Token | 执行最近一次或指定的 `===RUN===` 命令 |
-| `POST` | `/repair` | 需要 Token | 根据报错输出与目录树生成修复提示词 |
+| `POST` | `/run` | 需要 Token | 执行最近一次或指定的 `===RUN===` 命令；dev server 类命令改为后台启动并返回 `url` |
+| `POST` | `/repair` | 需要 Token | 报错归因并生成修复提示词；环境类错误返回 `mode: env` + 最简方案（`force: true` 可强制出提示词） |
+| `POST` | `/open` | 需要 Token | 按项目类型打开入口：静态页直接开，长驻项目后台起服务再开 |
 
 ## 配置与数据路径
 
@@ -154,6 +161,15 @@ Paste2Run 具备本地写盘与执行命令能力，因此所有边界默认收�
 - **体积与格式限制**：单次请求上限 4MB，仅处理纯文本代码，不解析图片或二进制附件。
 
 ## 更新日志
+
+### v0.4.0
+- **报错归因**：新增 `classify_error()`，把失败分成 `env`（环境/脚本问题）与 `file`（代码问题）。环境类不再把烂报错甩给 AI 乱改，直接给出最简运行方案并复制到剪贴板。
+- **项目探测**：新增 `detect_project()` / `minimal_run_plan()`，静态、Node、Python、Rust、Go、Makefile 各自给出可执行的运行方案。
+- **落地即打开**：`apply` 后纯静态项目自动打开入口页；`===RUN===` 是 dev server 时改为后台启动并抓取监听地址，再自动开浏览器，复用已运行实例不会重复拉端口。
+- **备份不膨胀**：`backup_mode = last | stamp | off`，默认 `last`，多轮修复只保留一份快照。
+- **站点扩展**：`@match` 从 6 条扩到 28 条，覆盖 LMArena、AI Studio、Kimi、Qwen、Copilot、Poe、Grok、Perplexity 等；新增 ALL-SITES 宽松版。
+- **适配健壮性**：定位逻辑改为「选择器候选 + 页面文本兜底 + 打分选优」，站点改版不再直接失效。
+- 修复 `detect_project()` 在「有 .py 但无标准入口」时的 `KeyError`。
 
 ### v0.3.1
 - 重构网页控制台为黑白极简 ASCII 风格，支持深黑 / 纸白反色切换、Prompt 预设切换、网页端手动粘贴与 Dry-Run 预览、实时 ASCII 目录树与手动运行面板。

@@ -34,7 +34,7 @@ import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.3.1"
+VERSION = "0.4.0"
 HOME = os.path.expanduser("~/.p2r")
 CONFIG = os.path.join(HOME, "config.json")
 LOG = os.path.join(HOME, "p2r.log")
@@ -63,7 +63,9 @@ def log(msg):
 
 def default_config():
     return {"target": DEFAULT_TARGET, "allow_run": False, "port": DEFAULT_PORT,
-            "token": secrets.token_hex(16)}
+            "token": secrets.token_hex(16),
+            "backup_mode": "last",   # last = 只保留最近一份备份，不随轮次增长
+            "auto_open": "static"}   # static = 纯静态项目落地后自动打开；always / off
 
 
 def load_config():
@@ -94,6 +96,10 @@ def load_config():
     except (TypeError, ValueError):
         cfg["port"] = DEFAULT_PORT
         dirty = True
+    if cfg.get("backup_mode") not in ("last", "stamp", "off"):
+        cfg["backup_mode"] = "last"
+    if cfg.get("auto_open") not in ("static", "always", "off"):
+        cfg["auto_open"] = "static"
     if dirty:
         save_config(cfg)
     return cfg
@@ -180,15 +186,36 @@ def safe_target(root, rel):
     return full
 
 
-def apply_text(text, target, dry_run=False, backup=True, source="manual"):
+def apply_text(text, target, dry_run=False, backup=True, source="manual", backup_mode=None):
     files, run_cmds = parse(text)
     if not files:
         return {"ok": False, "error": "没找到 ===FILE: ...=== 标记", "files": []}
+
+    if backup_mode not in ("last", "stamp", "off"):
+        backup_mode = (load_config().get("backup_mode") or "last")
 
     root = os.path.abspath(os.path.expanduser(target))
     os.makedirs(root, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")
     written, skipped = [], []
+
+    # 惰性备份目录：last 模式只保留最近一份，多轮修复不会把磁盘堆满
+    bdir = [None]
+
+    def backup_one(rel, full):
+        if not backup or backup_mode == "off":
+            return
+        if bdir[0] is None:
+            if backup_mode == "last":
+                base = os.path.join(root, ".p2r", "backup", "last")
+                if os.path.isdir(base):
+                    shutil.rmtree(base, ignore_errors=True)
+                bdir[0] = base
+            else:
+                bdir[0] = os.path.join(root, ".p2r", "backup", stamp)
+        bpath = os.path.join(bdir[0], rel.replace("/", os.sep))
+        os.makedirs(os.path.dirname(bpath), exist_ok=True)
+        shutil.copy2(full, bpath)
 
     for rel, content in files:
         try:
@@ -200,11 +227,8 @@ def apply_text(text, target, dry_run=False, backup=True, source="manual"):
             written.append({"path": rel, "bytes": len(content.encode()), "dryRun": True})
             continue
         os.makedirs(os.path.dirname(full), exist_ok=True)
-        if backup and os.path.exists(full):
-            bdir = os.path.join(root, ".p2r", "backup", stamp)
-            bpath = os.path.join(bdir, rel.replace("/", os.sep))
-            os.makedirs(os.path.dirname(bpath), exist_ok=True)
-            shutil.copy2(full, bpath)
+        if os.path.exists(full):
+            backup_one(rel, full)
         with open(full, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(content)
         written.append({"path": rel, "bytes": len(content.encode())})
@@ -216,13 +240,14 @@ def apply_text(text, target, dry_run=False, backup=True, source="manual"):
         "files": written,
         "skipped": skipped,
         "run": run_cmds,
+        "backupMode": backup_mode,
     }
     if not dry_run:
         os.makedirs(os.path.join(root, ".p2r"), exist_ok=True)
         with open(os.path.join(root, ".p2r", "last-apply.json"), "w", encoding="utf-8") as fh:
             json.dump(manifest, fh, ensure_ascii=False, indent=2)
-    log("apply source=%s target=%s files=%d skipped=%d dry=%s"
-        % (source, root, len(written), len(skipped), dry_run))
+    log("apply source=%s target=%s files=%d skipped=%d dry=%s backup=%s"
+        % (source, root, len(written), len(skipped), dry_run, backup_mode))
     return {"ok": True, **manifest}
 
 
@@ -312,6 +337,369 @@ def repair_prompt(root, output, original_mood=""):
           "每个文件给完整内容，不要 diff，不要省略号，不要解释。"
           "如果错误来自缺少依赖，请同时更新 package.json 或给出安装命令放在 ===RUN=== 段。"
     )
+
+
+# ----------------------------------------------------------------
+# 报错归因：区分「代码写错了」和「环境/脚本跑不起来」
+# ----------------------------------------------------------------
+
+_ENV_RULES = (
+    (re.compile(r"(?:command not found|is not recognized as an internal or external command|不是内部或外部命令)", re.I),
+     "命令不存在，系统里没有装这个工具"),
+    (re.compile(r"\b(?:spawn\s+\S+\s+ENOENT|ENOENT[^\n]*spawn)", re.I), "要执行的程序不存在"),
+    (re.compile(r"No such file or directory: '?(npm|node|python3?|pip3?|yarn|pnpm|cargo|go)'?", re.I),
+     "运行环境缺失"),
+    (re.compile(r"EADDRINUSE|address already in use|端口.{0,8}被占用", re.I), "端口被占用"),
+    (re.compile(r"EACCES|Permission denied", re.I), "权限不足"),
+    (re.compile(r"(?:Could not resolve host|getaddrinfo ENOTFOUND|ETIMEDOUT|EAI_AGAIN|ECONNREFUSED|network)", re.I),
+     "网络不可达，依赖下载失败"),
+    (re.compile(r"npm ERR! code (?:E404|EAI_AGAIN|ETIMEDOUT|ECONNREFUSED|ENOTFOUND|EACCES)", re.I),
+     "npm 拉包失败"),
+)
+
+_DEP_ERR_RULES = (
+    (re.compile(r"(?:Cannot find module|Cannot find package|ERR_MODULE_NOT_FOUND)[^\n]*?['\"]((?!\.)[^'\"/][^'\"]*)['\"]", re.I),
+     "缺少第三方依赖"),
+    (re.compile(r"ModuleNotFoundError: No module named '([^']+)'", re.I), "缺少 Python 依赖"),
+)
+
+_FILE_RULES = (
+    (re.compile(r"(?:SyntaxError|IndentationError|TabError|Unexpected token|Unexpected end of input)", re.I),
+     "语法错误"),
+    (re.compile(r"error TS\d+", re.I), "TypeScript 类型错误"),
+    (re.compile(r"Module not found: Error: Can't resolve '(?:\./|\.\./)", re.I), "引用了不存在的本地文件"),
+    (re.compile(r"(?:Cannot find module|ERR_MODULE_NOT_FOUND)[^\n]*['\"](?:\./|\.\./)", re.I),
+     "引用了不存在的本地文件"),
+    (re.compile(r"(?:ReferenceError|TypeError|NameError|ImportError|AttributeError|KeyError|IndexError)", re.I),
+     "运行时代码错误"),
+    (re.compile(r"(?:Failed to compile|BUILD FAILED|Compilation failed|Parse error)", re.I), "构建/解析失败"),
+    (re.compile(r"ENOENT[^\n]*?open ['\"](?!/)([^'\"]+)['\"]", re.I), "代码引用了不存在的文件"),
+)
+
+
+def classify_error(output, code=None):
+    """把运行失败归成三类：
+    env   = 脚本/环境跑不起来，改代码没用，应该给用户一个最简方案
+    file  = AI 写的文件有问题，应该生成修复提示词
+    unknown = 无法判断，交给 AI 自查（提示词里会要求它先判断）
+    """
+    out = (output or "")
+    reasons = []
+
+    if code in (126, 127):
+        return {"class": "env",
+                "reasons": ["退出码 %s：命令找不到或无法执行" % code],
+                "hint": "这不是代码问题，是本机缺运行环境"}
+
+    for pat, why in _ENV_RULES:
+        m = pat.search(out)
+        if m:
+            reasons.append("%s：%s" % (why, m.group(0)[:80]))
+            return {"class": "env", "reasons": reasons, "hint": "这不是代码问题，是本机环境或命令的问题"}
+
+    for pat, why in _DEP_ERR_RULES:
+        m = pat.search(out)
+        if m:
+            reasons.append("%s：%s" % (why, m.group(1)[:60]))
+            return {"class": "env", "reasons": reasons,
+                    "hint": "依赖没装，装一下就行，代码本身没坏", "missing": m.group(1)}
+
+    for pat, why in _FILE_RULES:
+        m = pat.search(out)
+        if m:
+            reasons.append("%s：%s" % (why, m.group(0)[:80]))
+            return {"class": "file", "reasons": reasons, "hint": "这是文件内容的问题，让 AI 改文件"}
+
+    return {"class": "unknown", "reasons": reasons,
+            "hint": "我判断不出来是环境还是代码问题，交给 AI 自查"}
+
+
+def detect_entry(root):
+    """找最适合直接打开的页面入口。"""
+    for rel in ("index.html", "public/index.html", "src/index.html",
+                "dist/index.html", "build/index.html", "www/index.html"):
+        p = os.path.join(root, rel.replace("/", os.sep))
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def detect_project(root):
+    """静态推断项目类型，用于给出最简运行方案。"""
+    def has(name):
+        return os.path.isfile(os.path.join(root, name))
+
+    info = {"kind": "unknown", "entry": detect_entry(root), "commands": [], "notes": []}
+
+    if has("package.json"):
+        info["kind"] = "node"
+        scripts = {}
+        try:
+            with open(os.path.join(root, "package.json"), encoding="utf-8") as fh:
+                scripts = (json.load(fh) or {}).get("scripts") or {}
+        except Exception:
+            info["notes"].append("package.json 解析失败")
+        need_install = not os.path.isdir(os.path.join(root, "node_modules"))
+        for name in ("dev", "start", "serve", "preview"):
+            if name in scripts:
+                if need_install:
+                    info["commands"].append("npm install")
+                info["commands"].append("npm run %s" % name)
+                info["long_running"] = True
+                break
+        else:
+            if "build" in scripts:
+                if need_install:
+                    info["commands"].append("npm install")
+                info["commands"].append("npm run build")
+            elif need_install:
+                info["commands"].append("npm install")
+        if info["entry"] is None and os.path.isdir(os.path.join(root, "dist")):
+            info["entry"] = detect_entry(root)
+        return info
+
+    if has("Cargo.toml"):
+        info.update({"kind": "rust", "commands": ["cargo run"]})
+        return info
+    if has("go.mod"):
+        info.update({"kind": "go", "commands": ["go run ."]})
+        return info
+    if has("requirements.txt") or any(f.endswith(".py") for f in os.listdir(root) if os.path.isfile(os.path.join(root, f))):
+        info["kind"] = "python"
+        if has("requirements.txt"):
+            info["commands"].append("pip install -r requirements.txt")
+        for cand in ("main.py", "app.py", "run.py", "server.py"):
+            if has(cand):
+                info["commands"].append("python3 %s" % cand)
+                info["long_running"] = True
+                break
+        if not info.get("long_running"):
+            # 有 .py 但没有标准入口：如果同时有页面入口，就当静态站处理
+            if info["entry"]:
+                info.update({"kind": "static", "commands": []})
+            else:
+                info["notes"].append("没找到 main.py / app.py / run.py 入口")
+        return info
+    if has("Makefile"):
+        info.update({"kind": "make", "commands": ["make"]})
+        return info
+    if info["entry"]:
+        info.update({"kind": "static", "commands": []})
+        return info
+    return info
+
+
+_COMMON_PORTS = (5173, 3000, 4173, 8080, 8000, 5000, 4200)
+_URL_RE = re.compile(r"https?://(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?\S*", re.I)
+_LONG_RUNNING_RE = re.compile(
+    r"(?:\bdev\b|\bserve\b|\bserve\w*\b|\bpreview\b|\bstart\b|runserver|\bflask\s+run\b|\bvite\b|\bng\s+serve\b|\bnext\s+dev\b)",
+    re.I)
+
+def looks_long_running(cmd):
+    """dev server 类命令不适合同步等待，要改成后台起。"""
+    if not cmd:
+        return False
+    low = cmd.lower()
+    if any(k in low for k in ("build", "install", "test", "lint")) and "dev" not in low:
+        return False
+    return bool(_LONG_RUNNING_RE.search(low))
+
+
+def _is_entry_cmd(cmd, plan):
+    """命令本身就是长驻入口（python3 app.py / cargo run）时，同步跑会一直挂着。"""
+    if not cmd or not plan.get("longRunning"):
+        return False
+    c = cmd.strip().lower()
+    for entry_cmd in (plan.get("commands") or []):
+        e = entry_cmd.strip().lower()
+        if e and (c == e or e in c):
+            return True
+    return False
+
+
+def _port_open(port, host="127.0.0.1", timeout=0.6):
+    import socket
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def start_dev_server(root, cmd, wait=25):
+    """后台起 dev server，尽量抓到它监听的地址，然后返回给前端打开。"""
+    for pat in BLOCKED_PATTERNS:
+        if pat.search((cmd or "").lower()):
+            return {"ok": False, "error": "命令里包含危险操作，已拒绝"}
+    try:
+        proc = subprocess.Popen(
+            cmd, shell=True, cwd=root,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            env={**os.environ, "CI": "1", "NO_COLOR": "1", "BROWSER": "none"},
+            start_new_session=True,
+        )
+    except OSError as exc:
+        return {"ok": False, "error": "无法执行: %s" % exc}
+
+    buf = []
+
+    def reader():
+        try:
+            for raw in iter(proc.stdout.readline, b""):
+                buf.append(raw.decode("utf-8", "replace"))
+        except Exception:
+            pass
+
+    th = threading.Thread(target=reader, daemon=True)
+    th.start()
+
+    url = None
+    deadline = time.time() + wait
+    while time.time() < deadline:
+        joined = "".join(buf)
+        m = _URL_RE.search(joined)
+        if m:
+            url = m.group(0).rstrip(".,;)")
+            break
+        if proc.poll() is not None and buf and not _URL_RE.search("".join(buf)):
+            break
+        time.sleep(0.4)
+
+    if not url:
+        # 只在进程还活着时才按常见端口兑底；进程已经退出就不能乱猜，
+        # 否则会错把本机别的服务（比如 8080）当成刚起的项目
+        exited = proc.poll() is not None
+        if not exited:
+            for port in _COMMON_PORTS:
+                if _port_open(port):
+                    url = "http://127.0.0.1:%d/" % port
+                    break
+
+    os.makedirs(os.path.join(root, ".p2r"), exist_ok=True)
+    try:
+        with open(os.path.join(root, ".p2r", "dev.pid"), "w") as fh:
+            fh.write(str(proc.pid))
+        if url:
+            with open(os.path.join(root, ".p2r", "dev.url"), "w") as fh:
+                fh.write(url)
+    except OSError:
+        pass
+
+    out = "".join(buf)[-MAX_TAIL:]
+    alive = proc.poll() is None
+    if not alive and url:
+        # shell 可能已退出而服务进程被接管，以端口能否连上为准
+        pm = re.search(r":(\d+)", url)
+        alive = bool(pm and _port_open(int(pm.group(1))))
+    log("dev-server pid=%s url=%s alive=%s" % (proc.pid, url, alive))
+    if not alive and not url:
+        return {"ok": False, "error": "启动命令直接退出，没跑起来",
+                "output": out, "alive": False, "pid": proc.pid}
+    return {"ok": True, "pid": proc.pid, "url": url, "output": out, "alive": alive}
+
+
+def open_target(path_or_url):
+    """跨平台打开文件或网址。"""
+    target = path_or_url
+    if not target:
+        return {"ok": False, "error": "没有可打开的目标"}
+    if not target.startswith(("http://", "https://", "file://")):
+        target = "file://" + os.path.abspath(target).replace(os.sep, "/")
+    try:
+        if os.name == "nt":
+            os.startfile(target)  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", target])
+        else:
+            opener = shutil.which("xdg-open") or shutil.which("gio")
+            if not opener:
+                return {"ok": False, "error": "本机没有 xdg-open，无法自动打开浏览器",
+                        "url": target, "manual": True}
+            subprocess.Popen([opener, target],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "url": target}
+    return {"ok": True, "url": target}
+
+
+def open_project(root):
+    """按项目类型决定：静态页直接开，需要服务的就先后台起再开。"""
+    info = detect_project(root)
+    if info.get("long_running") and info.get("commands"):
+        # 已经在跑就直接打开，不要重复拉起端口冲突的第二个实例
+        running = _running_dev_url(root)
+        if running:
+            opened = open_target(running)
+            return {"ok": True, "mode": "server", "url": running,
+                    "opened": opened, "reused": True}
+        cmd = info["commands"][-1]
+        res = start_dev_server(root, cmd)
+        if res.get("url"):
+            opened = open_target(res["url"])
+            return {"ok": True, "mode": "server", "url": res["url"],
+                    "opened": opened, "output": res.get("output", "")[:1500]}
+        return {"ok": False, "mode": "server", "error": "服务没起来，没抓到地址",
+                "output": res.get("output", "")[:1500], "plan": info}
+    entry = info.get("entry")
+    if entry:
+        opened = open_target(entry)
+        return {"ok": bool(opened.get("ok")), "mode": "static",
+                "url": opened.get("url"), "error": opened.get("error"), "plan": info}
+    return {"ok": False, "error": "这个项目没有可直接打开的入口，需要在终端里手动跑", "plan": info}
+
+
+def minimal_run_plan(root):
+    """给用户看的「最简运行方案」，不依赖 AI。"""
+    info = detect_project(root)
+    cmds = info.get("commands") or []
+    lines = []
+    if info.get("kind") == "static" and info.get("entry"):
+        lines.append("这是个纯静态页，双击 %s 就能看" % os.path.relpath(info["entry"], root))
+    elif cmds:
+        lines.append("在终端进入 %s 然后依次执行：" % root)
+        lines.extend("  " + c for c in cmds)
+        if info.get("long_running"):
+            lines.append("（长驻服务，也可以直接点 [ ◎ OPEN PROJECT ]，脚本会后台起好再打开浏览器）")
+    elif info.get("kind") == "python":
+        lines.append("是个 Python 项目，但没找到 main.py / app.py / run.py，先看 README 确认入口文件")
+    else:
+        lines.append("没识别出项目类型，可能需要先看 README，或把报错发给 AI 让它给运行命令")
+    if info.get("kind") == "node" and not shutil.which("npm"):
+        lines.append("提示：本机没检测到 npm，先装 Node.js（https://nodejs.org）")
+    if info.get("kind") == "python" and not shutil.which("python3"):
+        lines.append("提示：本机没检测到 python3")
+    return {"kind": info.get("kind"), "commands": cmds,
+            "entry": info.get("entry"), "longRunning": bool(info.get("long_running")),
+            "notes": info.get("notes"), "text": "\n".join(lines)}
+
+
+_LAST_OPEN = {"key": None, "at": 0.0}
+
+
+def _running_dev_url(root):
+    """上次起的 dev server 还在监听就复用，不看 pid（shell 可能已经把进程交给 init）。"""
+    urlf = os.path.join(root, ".p2r", "dev.url")
+    if not os.path.isfile(urlf):
+        return None
+    try:
+        url = open(urlf).read().strip()
+    except Exception:
+        return None
+    pm = re.search(r":(\d+)", url or "")
+    if pm and _port_open(int(pm.group(1))):
+        return url
+    return None
+
+
+def _should_open(path, cooldown=10.0):
+    """同一个入口短时间内不重复弹浏览器（多轮修复时很必要）。"""
+    key = os.path.abspath(path)
+    now = time.time()
+    if _LAST_OPEN["key"] == key and now - _LAST_OPEN["at"] < cooldown:
+        return False
+    _LAST_OPEN["key"] = key
+    _LAST_OPEN["at"] = now
+    return True
 
 
 def parse_host_header(header_val):
@@ -544,16 +932,26 @@ pre.tree-box { white-space: pre; word-break: normal; max-height: 220px; }
         <div class="panel-body">
           <div class="row">
             <a class="btn primary" href="/p2r.user.js">[ ↓ INSTALL / UPDATE p2r.user.js ]</a>
+            <a class="btn" href="/p2r.user.js?all=1">[ ↓ ALL-SITES 宽松版 ]</a>
             <button id="btn-copy-endpoint">[ COPY ENDPOINT ]</button>
           </div>
-          <div class="hint">需要先安装 Tampermonkey。从本页安装会自动注入当前端口与 <code>X-P2R-Token</code>。</div>
+          <div class="hint">需要先安装 Tampermonkey。从本页安装会自动注入当前端口与 <code>X-P2R-Token</code>。宽松版会在所有网站注入，靠内容里的 <code>===FILE:</code> 判定要不要动作，适配没收录的新站点用。</div>
           <div class="sites-bar">
             <span class="site-tag">ChatGPT</span>
             <span class="site-tag">Claude</span>
             <span class="site-tag">Gemini</span>
+            <span class="site-tag">AI Studio</span>
             <span class="site-tag">DeepSeek</span>
+            <span class="site-tag">LMArena</span>
+            <span class="site-tag">Kimi</span>
+            <span class="site-tag">通义 / Qwen</span>
             <span class="site-tag">腾讯元宝</span>
             <span class="site-tag">豆包</span>
+            <span class="site-tag">Copilot</span>
+            <span class="site-tag">Poe</span>
+            <span class="site-tag">Grok</span>
+            <span class="site-tag">Perplexity</span>
+            <span class="site-tag">OpenRouter</span>
           </div>
         </div>
       </section>
@@ -575,6 +973,11 @@ pre.tree-box { white-space: pre; word-break: normal; max-height: 220px; }
             </span>
             <span id="run-state-tag" style="font-size:11px;color:var(--fg-dim)">SAFE: OFF</span>
           </div>
+          <div class="row" style="margin-top:8px;gap:8px">
+            <button class="sm" id="btn-backup-mode">[ BACKUP: LAST ]</button>
+            <button class="sm" id="btn-auto-open">[ AUTO-OPEN: STATIC ]</button>
+          </div>
+          <div class="hint" style="margin-top:6px">BACKUP 切 LAST 只留最近一份备份，多轮修复不会把磁盘堆满；OFF 完全不备份。AUTO-OPEN 控制落地后要不要帮你打开页面。</div>
           <div class="sec-grid">
             <div class="sec-item"><span class="k">BIND</span><span class="v">127.0.0.1</span></div>
             <div class="sec-item"><span class="k">AUTH</span><span class="v">X-P2R-TOKEN</span></div>
@@ -642,6 +1045,10 @@ pre.tree-box { white-space: pre; word-break: normal; max-height: 220px; }
         </div>
         <div class="panel-body">
           <div id="recent-wrap"><div style="color:var(--fg-dim)">还没有落地记录</div></div>
+          <div class="row" style="margin:10px 0 4px">
+            <button class="sm" id="btn-open-project">[ ◎ OPEN PROJECT ]</button>
+          </div>
+          <div class="hint" style="margin-bottom:10px">静态页直接开；带 dev server 的项目会后台起服务再开，不用自己去目录里点 index.html。</div>
           <div class="run-box" id="run-panel" style="display:none">
             <div class="row" style="justify-content:space-between;margin-bottom:8px">
               <span style="font-size:11px;color:var(--fg-dim)">DETECTED ===RUN===</span>
@@ -707,6 +1114,7 @@ echo "Paste2Run OK"`;
   const H = () => ({ "Content-Type": "application/json", "X-P2R-Token": TOKEN });
   let curState = { allow_run: false, target: "", port: 18765, last: null };
   let lastRunOutput = "";
+  let lastRunCode = null;
   let toastTimer = null;
 
   function toast(msg) {
@@ -738,6 +1146,24 @@ echo "Paste2Run OK"`;
     $("#toggle-run").setAttribute("aria-checked", String(curState.allow_run));
     $("#run-state-tag").textContent = curState.allow_run ? "ACTIVE: ON" : "SAFE: OFF";
     $("#bar-run").textContent = "RUN: " + (curState.allow_run ? "ON" : "OFF");
+    const bm = $("#btn-backup-mode");
+    if (bm) bm.textContent = "[ BACKUP: " + String(curState.backup_mode || "last").toUpperCase() + " ]";
+    const ao = $("#btn-auto-open");
+    if (ao) ao.textContent = "[ AUTO-OPEN: " + String(curState.auto_open || "static").toUpperCase() + " ]";
+  }
+
+  async function cycleSetting(key, seq) {
+    const cur = curState[key] || seq[0];
+    const next = seq[(seq.indexOf(cur) + 1) % seq.length];
+    try {
+      const r = await fetch("/config", { method: "POST", headers: H(), body: JSON.stringify({ [key]: next }) });
+      const j = await r.json();
+      if (j.ok) {
+        curState[key] = j[key];
+        renderRunToggle();
+        toast(key.toUpperCase().replace("_", "-") + ": " + String(j[key]).toUpperCase());
+      } else toast("SET FAILED");
+    } catch (e) { toast("SET FAILED"); }
   }
 
   function renderRecent(last) {
@@ -854,6 +1280,8 @@ echo "Paste2Run OK"`;
   }
 
   $("#btn-save").addEventListener("click", () => saveConfig());
+  $("#btn-backup-mode").addEventListener("click", () => cycleSetting("backup_mode", ["last", "off", "stamp"]));
+  $("#btn-auto-open").addEventListener("click", () => cycleSetting("auto_open", ["static", "always", "off"]));
   const onToggleRun = () => saveConfig(!curState.allow_run);
   $("#toggle-run").addEventListener("click", onToggleRun);
   $("#toggle-run").addEventListener("keydown", (e) => { if (e.key === " " || e.key === "Enter") { e.preventDefault(); onToggleRun(); } });
@@ -874,6 +1302,23 @@ echo "Paste2Run OK"`;
   });
   $("#btn-copy-prompt").addEventListener("click", () => copyText($("#prompt-box").textContent, "PROMPT COPIED"));
 
+  $("#btn-open-project").addEventListener("click", async () => {
+    const out = $("#run-output");
+    out.style.display = "block";
+    out.textContent = "OPENING…";
+    try {
+      const r = await fetch("/open", { method: "POST", headers: H(), body: JSON.stringify({}) });
+      const j = await r.json();
+      if (j.ok) {
+        out.textContent = `[OPENED] ${j.mode} -> ${j.url || ""}`;
+        toast("已打开 " + (j.url || ""));
+      } else {
+        out.textContent = `[ERR] ${j.error || "打开失败"}\n` + ((j.plan && j.plan.text) || (j.output || ""));
+        toast("打开失败");
+      }
+    } catch (e) { out.textContent = "[ERR] 请求失败"; }
+  });
+
   $("#btn-exec-run").addEventListener("click", async () => {
     const out = $("#run-output");
     out.style.display = "block";
@@ -884,11 +1329,28 @@ echo "Paste2Run OK"`;
       if (j.error) {
         out.textContent = `[ERR] ${j.error}`;
         $("#btn-copy-repair").style.display = "none";
+      } else if (j.longRunning) {
+        lastRunOutput = j.output || "";
+        out.textContent = `[DEV SERVER] ${j.alive ? "RUNNING" : "EXITED"}${j.url ? " -> " + j.url : ""}\n` +
+          (lastRunOutput || "(no output)");
+        toast(j.url ? `DEV SERVER: ${j.url}` : "dev server 没抓到地址");
+        $("#btn-copy-repair").style.display = "none";
       } else {
         lastRunOutput = j.output || "";
-        out.textContent = `[EXIT ${j.code}] (${j.duration}s)\n` + (lastRunOutput || "(no output)");
-        $("#btn-copy-repair").style.display = j.ok ? "none" : "inline-flex";
-        toast(j.ok ? `RUN OK (${j.duration}s)` : `RUN FAILED (EXIT ${j.code})`);
+        lastRunCode = j.code;
+        const cls = j.class || "";
+        const why = (j.reasons || []).join("；");
+        out.textContent = `[EXIT ${j.code}]${cls ? " " + cls.toUpperCase() : ""} (${j.duration}s)\n` +
+          (why ? why + "\n\n" : "") + (lastRunOutput || "(no output)");
+        if (j.ok) {
+          $("#btn-copy-repair").style.display = "none";
+          toast(`RUN OK (${j.duration}s)` + (j.open && j.open.url ? " -> " + j.open.url : ""));
+        } else {
+          $("#btn-copy-repair").style.display = "inline-flex";
+          $("#btn-copy-repair").textContent = cls === "env" ? "[ COPY 最简运行方案 ]" : "[ COPY REPAIR PROMPT ]";
+          $("#btn-copy-repair").dataset.mode = cls === "env" ? "env" : "repair";
+          toast(cls === "env" ? "这不是代码问题，是本机环境" : `RUN FAILED (EXIT ${j.code})`);
+        }
       }
     } catch (e) {
       out.textContent = "[ERR] 请求失败";
@@ -897,9 +1359,17 @@ echo "Paste2Run OK"`;
 
   $("#btn-copy-repair").addEventListener("click", async () => {
     try {
-      const r = await fetch("/repair", { method: "POST", headers: H(), body: JSON.stringify({ output: lastRunOutput }) });
+      const mode = $("#btn-copy-repair").dataset.mode || "repair";
+      const r = await fetch("/repair", { method: "POST", headers: H(),
+        body: JSON.stringify({ output: lastRunOutput, code: lastRunCode, force: mode === "repair" }) });
       const j = await r.json();
-      if (j.ok && j.prompt) copyText(j.prompt, "REPAIR PROMPT COPIED");
+      if (j.mode === "env") {
+        copyText((j.plan && j.plan.text) || "", "最简运行方案已复制");
+      } else if (j.prompt) {
+        copyText(j.prompt, "REPAIR PROMPT COPIED");
+      } else {
+        toast("没有可复制的内容");
+      }
     } catch (e) { toast("REPAIR FAILED"); }
   });
 
@@ -933,15 +1403,19 @@ def setup_html(cfg):
             .replace("__TARGET__", html.escape(cfg.get("target") or DEFAULT_TARGET, quote=True)))
 
 
-def userscript_text(cfg):
+def userscript_text(cfg, all_sites=False):
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "p2r.user.js")
     if not os.path.exists(path):
         return None
     with open(path, encoding="utf-8") as fh:
         src = fh.read()
     endpoint = "http://127.0.0.1:%d" % int(getattr_current_port(cfg))
-    return (src.replace("__P2R_ENDPOINT__", endpoint)
-               .replace("__P2R_TOKEN__", cfg.get("token", "")))
+    out = (src.replace("__P2R_ENDPOINT__", endpoint)
+              .replace("__P2R_TOKEN__", cfg.get("token", "")))
+    if all_sites:
+        # 宽松版：所有站点注入，靠内容识别判断要不要动作
+        out = out.replace("// @grant", "// @match        *://*/*\n// @grant", 1)
+    return out
 
 
 _CURRENT_PORT = [DEFAULT_PORT]
@@ -1033,7 +1507,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._raw(200, setup_html(cfg).encode("utf-8"), "text/html; charset=utf-8")
 
         if path == "/p2r.user.js":
-            src = userscript_text(cfg)
+            qs = urllib.parse.parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+            all_sites = (qs.get("all") or [""])[0] in ("1", "true", "yes")
+            src = userscript_text(cfg, all_sites=all_sites)
             if src is None:
                 return self._json(404, {"ok": False, "error": "找不到 p2r.user.js"})
             return self._raw(200, src.encode("utf-8"), "application/javascript; charset=utf-8")
@@ -1042,6 +1518,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {
                 "ok": True, "version": VERSION, "port": _CURRENT_PORT[0],
                 "target": cfg.get("target"), "allow_run": bool(cfg.get("allow_run")),
+                "backup_mode": cfg.get("backup_mode"), "auto_open": cfg.get("auto_open"),
             })
 
         if path == "/state":
@@ -1057,7 +1534,8 @@ class Handler(BaseHTTPRequestHandler):
                         last = None
             return self._json(200, {"ok": True, "version": VERSION, "port": _CURRENT_PORT[0],
                                     "target": target, "allow_run": bool(cfg.get("allow_run")),
-                                    "last": last})
+                                    "backup_mode": cfg.get("backup_mode"),
+                                    "auto_open": cfg.get("auto_open"), "last": last})
 
         if path == "/config":
             pub = {k: cfg.get(k) for k in ("target", "allow_run")}
@@ -1091,19 +1569,46 @@ class Handler(BaseHTTPRequestHandler):
                 cfg["target"] = os.path.abspath(os.path.expanduser(body["target"]))
             if "allow_run" in body:
                 cfg["allow_run"] = bool(body["allow_run"])
+            if body.get("backup_mode") in ("last", "stamp", "off"):
+                cfg["backup_mode"] = body["backup_mode"]
+            if body.get("auto_open") in ("static", "always", "off"):
+                cfg["auto_open"] = body["auto_open"]
             os.makedirs(os.path.expanduser(cfg["target"]), exist_ok=True)
             save_config(cfg)
             return self._json(200, {"ok": True, "target": cfg["target"],
-                                    "allow_run": cfg["allow_run"]})
+                                    "allow_run": cfg["allow_run"],
+                                    "backup_mode": cfg["backup_mode"],
+                                    "auto_open": cfg["auto_open"]})
 
         target = body.get("target") or cfg.get("target")
         if not target:
             return self._json(400, {"ok": False, "error": "没有目标目录，先在设置页填一个"})
         root = os.path.abspath(os.path.expanduser(target))
 
+        if path == "/open":
+            res = open_project(root)
+            res["target"] = root
+            return self._json(200 if res.get("ok") else 422, res)
+
         if path == "/run" or path == "/repair":
             if path == "/repair":
-                return self._json(200, {"ok": True, "prompt": repair_prompt(root, body.get("output") or "")})
+                output = body.get("output") or ""
+                verdict = classify_error(output, body.get("code"))
+                plan = minimal_run_plan(root)
+                force = bool(body.get("force"))
+                if verdict["class"] == "env" and not force:
+                    # 环境问题不让 AI 改代码，直接给用户最简方案
+                    return self._json(200, {
+                        "ok": True, "mode": "env", "prompt": "",
+                        "class": "env", "reasons": verdict.get("reasons"),
+                        "hint": verdict.get("hint"), "plan": plan,
+                    })
+                return self._json(200, {
+                    "ok": True, "mode": "repair",
+                    "class": verdict["class"], "reasons": verdict.get("reasons"),
+                    "hint": verdict.get("hint"), "plan": plan,
+                    "prompt": repair_prompt(root, output),
+                })
             if not cfg.get("allow_run"):
                 return self._json(403, {"ok": False, "error": "执行命令未启用，先在设置页勾选「自动执行」"})
             cmds = body.get("commands")
@@ -1115,8 +1620,30 @@ class Handler(BaseHTTPRequestHandler):
                             cmds = json.load(fh).get("run") or ""
                     except Exception:
                         cmds = ""
+            # 先用静态推断补全安装步骤，但 ===RUN=== 里用户自己的命令优先
+            plan = minimal_run_plan(root)
+            long_run = looks_long_running(cmds) or _is_entry_cmd(cmds, plan)
+            if long_run:
+                res = start_dev_server(root, cmds)
+                res["class"] = "env" if not res.get("ok") or not res.get("alive") else "ok"
+                res["longRunning"] = True
+                if res.get("url"):
+                    res["open"] = open_target(res["url"])
+                res["target"] = root
+                res["plan"] = plan
+                log("run(long-running) url=%s alive=%s" % (res.get("url"), res.get("alive")))
+                return self._json(200, res)
+
             res = run_in(root, cmds)
             res["target"] = root
+            res["plan"] = plan
+            if not res.get("ok"):
+                res.update(classify_error(res.get("output"), res.get("code")))
+            # 跑完如果项目有页面入口，顺手打开，少让用户自己找 index
+            if res.get("ok") and cfg.get("auto_open") in ("static", "always"):
+                entry = plan.get("entry")
+                if entry:
+                    res["open"] = open_target(entry)
             return self._json(200, res)
 
         if path != "/apply":
@@ -1126,6 +1653,16 @@ class Handler(BaseHTTPRequestHandler):
                             dry_run=bool(body.get("dryRun")),
                             source=body.get("source") or "web")
         result["target"] = root
+        if result.get("ok"):
+            plan = minimal_run_plan(root)
+            result["plan"] = plan
+            # 纯静态项目：落地即自动打开，省掉用户自己找 index.html 那一步
+            if not body.get("dryRun") and cfg.get("auto_open") in ("static", "always"):
+                want = cfg.get("auto_open") == "always" or (
+                    plan.get("kind") == "static" and not result.get("run"))
+                entry = plan.get("entry")
+                if want and entry and _should_open(entry):
+                    result["open"] = open_target(entry)
         return self._json(200 if result.get("ok") else 422, result)
 
 
@@ -1264,7 +1801,66 @@ npm install && npm run dev
         bdir = os.path.join(tmp, ".p2r", "backup")
         assert os.path.isdir(bdir) and os.listdir(bdir), "覆写没有备份"
 
-    print("selftest ok: 解析 / 围栏与尾随结语 / 乱序RUN / 加粗标记 / 越界与.git拦截 / IPv6 Host / 覆写备份 全部通过")
+        # last 模式：多轮覆写后备份体积不增长，只保留一份
+        for i in range(4):
+            apply_text("===FILE: index.html===\nv%d\n" % i, tmp, backup_mode="last")
+        last_dir = os.path.join(bdir, "last")
+        assert os.path.isdir(last_dir), "last 模式备份目录不存在"
+        stamps = [d for d in os.listdir(bdir) if d != "last"]
+        assert len(stamps) <= 1, "last 模式不应该产生多个时间戳目录: %s" % stamps
+        assert os.path.isfile(os.path.join(last_dir, "index.html")), "last 模式没有备份到文件"
+
+        # 错误归因
+        env_cases = [
+            ("sh: 1: vite: command not found", 127),
+            ("'npm' is not recognized as an internal or external command", 1),
+            ("Error: listen EADDRINUSE: address already in use :::3000", 1),
+            ("npm ERR! code E404 npm ERR! 404 Not Found", 1),
+            ("Error: Cannot find module 'react'", 1),
+        ]
+        for out, code in env_cases:
+            v = classify_error(out, code)
+            assert v["class"] == "env", (out, v)
+
+        file_cases = [
+            ("SyntaxError: Unexpected token '<'", 1),
+            ("src/App.tsx(12,5): error TS2304: Cannot find name 'foo'.", 2),
+            ("Module not found: Error: Can't resolve './components/Header' in '/app/src'", 1),
+            ("ReferenceError: useState is not defined", 1),
+        ]
+        for out, code in file_cases:
+            v = classify_error(out, code)
+            assert v["class"] == "file", (out, v)
+
+        # 项目类型与最简方案
+        with tempfile.TemporaryDirectory() as tmp2:
+            with open(os.path.join(tmp2, "index.html"), "w", encoding="utf-8") as fh:
+                fh.write("<h1>x</h1>")
+            info = detect_project(tmp2)
+            assert info["kind"] == "static" and info["entry"].endswith("index.html"), info
+            plan = minimal_run_plan(tmp2)
+            assert "双击" in plan["text"], plan
+            with open(os.path.join(tmp2, "package.json"), "w", encoding="utf-8") as fh:
+                json.dump({"scripts": {"dev": "vite", "build": "vite build"}}, fh)
+            info2 = detect_project(tmp2)
+            assert info2["kind"] == "node" and any("npm run dev" in c for c in info2["commands"]), info2
+            assert looks_long_running("npm run dev") is True
+            assert looks_long_running("npm install && npm run build") is False
+
+        # 只有 .py 没有标准入口的分支不能崩
+        with tempfile.TemporaryDirectory() as tmp3:
+            with open(os.path.join(tmp3, "foo.py"), "w", encoding="utf-8") as fh:
+                fh.write("print(1)\n")
+            i3 = detect_project(tmp3)
+            assert i3["kind"] == "python" and not i3.get("long_running"), i3
+            assert minimal_run_plan(tmp3)["text"], "空方案"
+            with open(os.path.join(tmp3, "index.html"), "w", encoding="utf-8") as fh:
+                fh.write("<h1>x</h1>")
+            i4 = detect_project(tmp3)
+            assert i4["kind"] == "static", i4
+
+    print("selftest ok: 解析 / 围栏与尾随结语 / 乱序RUN / 加粗标记 / 越界与.git拦截 / IPv6 Host /"
+          " 覆写备份(last不膨胀) / 报错归因 / 项目探测 全部通过")
 
 
 def main():
