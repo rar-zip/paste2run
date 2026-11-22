@@ -37,7 +37,7 @@ import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.4.4"
+VERSION = "0.4.5"
 HOME = os.path.expanduser("~/.p2r")
 CONFIG = os.path.join(HOME, "config.json")
 LOG = os.path.join(HOME, "p2r.log")
@@ -48,6 +48,8 @@ PORT_TRIES = 10
 
 FILE_RE = re.compile(r"^[ \t]*(?:\*\*)?===\s*FILE:\s*(.+?)\s*===\s*(?:\*\*)?[ \t]*$", re.M)
 RUN_RE = re.compile(r"^[ \t]*(?:\*\*)?===\s*RUN\s*===\s*(?:\*\*)?[ \t]*$", re.M)
+PROJECT_RE = re.compile(r"^[ \t]*(?:\*\*)?===\s*PROJECT:\s*(.+?)\s*===\s*(?:\*\*)?[ \t]*$", re.M)
+GATE_RE = re.compile(r"P2R[-_\s]?READY", re.I)
 
 _CONFIG_LOCK = threading.Lock()
 
@@ -69,7 +71,8 @@ def default_config():
             "token": secrets.token_hex(16),
             "backup_mode": "last",   # last = 只保留最近一份备份，不随轮次增长
             "auto_open": "static",   # static = 纯静态项目落地后自动打开；always / off
-            "static_open": "server"}  # server = 起内置静态服务再开；file = 直接 file://
+            "static_open": "server",  # server = 起内置静态服务再开；file = 直接 file://
+            "project_mode": "auto"}  # auto = 按重合度判断；always-new = 每次新开；single = 全落根目录
 
 
 def load_config():
@@ -142,13 +145,18 @@ def strip_fences(body):
 
 
 def parse(text):
-    """返回 (files: [(path, content)], run_commands: str)"""
+    """返回 (files: [(path, content)], run_commands: str)
+
+    ===PROJECT: 名字=== 也当分隔符处理，否则它会混进前一个文件的内容里。
+    """
     text = (text or "").replace("\ufeff", "").replace("\r\n", "\n")
     markers = []
     for mt in FILE_RE.finditer(text):
         markers.append(("file", mt.start(), mt.end(), mt.group(1).strip().strip("`\"'")))
     for mt in RUN_RE.finditer(text):
         markers.append(("run", mt.start(), mt.end(), ""))
+    for mt in PROJECT_RE.finditer(text):
+        markers.append(("project", mt.start(), mt.end(), mt.group(1).strip()))
     if not markers:
         return [], ""
 
@@ -160,12 +168,30 @@ def parse(text):
         chunk = text[end_pos:next_start]
         if kind == "file":
             files.append((label, strip_fences(chunk)))
-        else:
+        elif kind == "run":
             cmd = strip_fences(chunk).strip()
             if cmd:
                 run_parts.append(cmd)
     return files, "\n".join(run_parts).strip()
 
+
+def parse_project(text):
+    """取 ===PROJECT: 名字=== 里的名字，只保留安全字符。"""
+    mt = PROJECT_RE.search(text or "")
+    if not mt:
+        return ""
+    name = re.sub(r"[^0-9A-Za-z._-]+", "-", mt.group(1).strip().strip("`\"'"))
+    return name.strip("-.")[:60]
+
+
+# 导出 md 时用的标准提示词；与页面里 PROMPTS.std 保持一致，改一处要同步改另一处
+PROMPT_STD = """输出格式严格要求：
+每个文件用 ===FILE: 相对路径=== 开头，下面给该文件的完整内容，不要省略号，不要"其余同上"。
+不要在文件内容里再嵌套 ===FILE: 这样的行。
+
+如果是新项目，第一行先给 ===PROJECT: 英文小写项目名===；同一项目后续修改沿用同名，不要换。
+启动命令不是必填项：只有你确定某条命令能跑起来时，才在最后用 ===RUN=== 给一条；不确定就省略。
+全部给完后，最后单独一行输出 P2R-READY；只是讨论、片段或没写完时不要输出这个标记。"""
 
 PROTECTED_TOP_DIRS = {".git", ".p2r"}
 
@@ -192,16 +218,170 @@ def safe_target(root, rel):
     return full
 
 
-def apply_text(text, target, dry_run=False, backup=True, source="manual", backup_mode=None):
+PROJECT_CONFIDENCE = 0.6
+
+
+def resolve_root(base):
+    """返回上次落地的真实项目目录（auto 模式下可能是 base 的子目录）。"""
+    p = os.path.join(base, ".p2r", "last-target")
+    try:
+        with open(p, encoding="utf-8") as fh:
+            cand = fh.read().strip()
+        if cand and os.path.isdir(cand):
+            if os.path.realpath(cand).startswith(os.path.realpath(base) + os.sep) \
+                    or os.path.realpath(cand) == os.path.realpath(base):
+                return cand
+    except Exception:
+        pass
+    return base
+
+
+def _read_last_paths(root):
+    """读某个目录上一次落地的文件清单。"""
+    try:
+        with open(os.path.join(root, ".p2r", "last-apply.json"), encoding="utf-8") as fh:
+            data = json.load(fh) or {}
+        return {f.get("path") for f in (data.get("files") or []) if f.get("path")}
+    except Exception:
+        return set()
+
+
+def _project_candidates(base):
+    """根目录本身 + 各个子目录里，只要带 .p2r/last-apply.json 的就算一个已存在的项目。"""
+    cands = []
+    if os.path.isfile(os.path.join(base, ".p2r", "last-apply.json")):
+        cands.append(base)
+    try:
+        for name in sorted(os.listdir(base)):
+            if name in SKIP_DIRS or name.startswith("."):
+                continue
+            d = os.path.join(base, name)
+            if os.path.isdir(d) and os.path.isfile(os.path.join(d, ".p2r", "last-apply.json")):
+                cands.append(d)
+    except OSError:
+        pass
+    return cands
+
+
+def decide_project_root(base, files, project="", mode="auto"):
+    """决定这次落地到哪个目录，返回 (root, reason)。
+
+    - AI 给了 ===PROJECT: 名字=== 就用它
+    - single：全部落根目录（旧行为）
+    - always-new：每次新开 proj-时间戳
+    - auto：和已有项目比文件路径重合度，>= 60% 算同一项目，否则新开
+    """
+    if project:
+        return os.path.join(base, project), "project-tag"
+    if mode == "single":
+        return base, "single"
+    if mode == "always-new":
+        return os.path.join(base, "proj-" + time.strftime("%Y%m%d-%H%M%S")), "always-new"
+
+    cands = _project_candidates(base)
+    paths = {p for p, _ in files}
+    best, best_score = None, 0.0
+    for cand in cands:
+        last = _read_last_paths(cand)
+        if not last:
+            continue
+        score = len(paths & last) / float(max(1, len(paths)))
+        if score > best_score:
+            best, best_score = cand, score
+
+    if best is not None and best_score >= PROJECT_CONFIDENCE:
+        return best, "match-%.2f" % best_score
+    if not cands:
+        # 第一次落地，根目录还是空的，直接用根目录
+        return base, "first-run"
+    return os.path.join(base, "proj-" + time.strftime("%Y%m%d-%H%M%S")), "new-%.2f" % best_score
+
+
+def export_workflow(root):
+    """把当前项目的结构、最近落地、运行方式和协议导成一份 md，方便换 AI 接续。"""
+    root = os.path.abspath(os.path.expanduser(root))
+    info = detect_project(root)
+    plan = minimal_run_plan(root)
+    last = {}
+    try:
+        with open(os.path.join(root, ".p2r", "last-apply.json"), encoding="utf-8") as fh:
+            last = json.load(fh) or {}
+    except Exception:
+        last = {}
+
+    files = last.get("files") or []
+    out = []
+    out.append("# Paste2Run 工作流导出")
+    out.append("")
+    out.append("- 导出时间: %s" % time.strftime("%Y-%m-%d %H:%M:%S"))
+    out.append("- 工具版本: %s" % VERSION)
+    out.append("- 项目目录: %s" % root)
+    if last.get("project"):
+        out.append("- 项目名: %s" % last["project"])
+    out.append("- 项目类型: %s" % (info.get("kind") or "unknown"))
+    out.append("")
+    out.append("## 目标与进度（手动补充）")
+    out.append("")
+    out.append("- 目标: ")
+    out.append("- 已完成: ")
+    out.append("- 待办: ")
+    out.append("")
+    out.append("## 当前文件结构")
+    out.append("")
+    out.append("```text")
+    out.append(project_tree(root))
+    out.append("```")
+    out.append("")
+    out.append("## 最近一次落地")
+    out.append("")
+    if files:
+        out.append("- 时间: %s" % last.get("time", ""))
+        out.append("- 文件:")
+        for f in files:
+            out.append("  - `%s` (%s bytes)" % (f.get("path"), f.get("bytes")))
+        if last.get("run"):
+            out.append("- 启动命令: `%s`" % last["run"])
+    else:
+        out.append("（这个目录还没有落地记录）")
+    out.append("")
+    out.append("## 运行方式")
+    out.append("")
+    out.append("```text")
+    out.append((plan.get("text") or "").strip())
+    out.append("```")
+    out.append("")
+    out.append("## 输出协议（让下一个 AI 按这个格式继续）")
+    out.append("")
+    out.append("```text")
+    out.append(PROMPT_STD)
+    out.append("```")
+    out.append("")
+    out.append("## 交接说明")
+    out.append("")
+    out.append("上面是当前项目的完整结构和进度。请在这个基础上继续，只输出需要改动的文件，")
+    out.append("每个文件用 ===FILE: 相对路径=== 给完整内容，沿用 ===PROJECT: 名称===，最后输出 P2R-READY。")
+    return "\n".join(out) + "\n"
+
+
+def apply_text(text, target, dry_run=False, backup=True, source="manual",
+               backup_mode=None, project=None, project_mode=None):
     files, run_cmds = parse(text)
     if not files:
         return {"ok": False, "error": "没找到 ===FILE: ...=== 标记", "files": []}
 
+    cfg = load_config()
     if backup_mode not in ("last", "stamp", "off"):
-        backup_mode = (load_config().get("backup_mode") or "last")
+        backup_mode = (cfg.get("backup_mode") or "last")
 
-    root = os.path.abspath(os.path.expanduser(target))
-    os.makedirs(root, exist_ok=True)
+    base = os.path.abspath(os.path.expanduser(target))
+    os.makedirs(base, exist_ok=True)
+    proj = project if project is not None else parse_project(text)
+    mode = project_mode if project_mode in ("auto", "single", "always-new") \
+        else (cfg.get("project_mode") or "auto")
+    root, root_reason = decide_project_root(base, files, proj, mode)
+    root = os.path.abspath(os.path.expanduser(root))
+    if not dry_run:
+        os.makedirs(root, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")
     written, skipped = [], []
 
@@ -243,6 +423,9 @@ def apply_text(text, target, dry_run=False, backup=True, source="manual", backup
         "time": time.strftime("%Y-%m-%d %H:%M:%S"),
         "source": source,
         "target": root,
+        "base": base,
+        "project": (os.path.basename(root) if root != base else ""),
+        "rootReason": root_reason,
         "files": written,
         "skipped": skipped,
         "run": run_cmds,
@@ -252,6 +435,14 @@ def apply_text(text, target, dry_run=False, backup=True, source="manual", backup
         os.makedirs(os.path.join(root, ".p2r"), exist_ok=True)
         with open(os.path.join(root, ".p2r", "last-apply.json"), "w", encoding="utf-8") as fh:
             json.dump(manifest, fh, ensure_ascii=False, indent=2)
+        # 在根目录记一笔真实项目目录，后面 /run /open /export 才知道去哪找
+        if root != base:
+            try:
+                os.makedirs(os.path.join(base, ".p2r"), exist_ok=True)
+                with open(os.path.join(base, ".p2r", "last-target"), "w", encoding="utf-8") as fh:
+                    fh.write(root)
+            except OSError:
+                pass
     log("apply source=%s target=%s files=%d skipped=%d dry=%s backup=%s"
         % (source, root, len(written), len(skipped), dry_run, backup_mode))
     return {"ok": True, **manifest}
@@ -1201,6 +1392,8 @@ pre.tree-box { white-space: pre; word-break: normal; max-height: 220px; }
 }
 .toast.show { opacity: 1; transform: translateY(0); }
 
+.shell { padding-bottom: 48px; }
+
 .statusbar {
   position: fixed; left: 0; right: 0; bottom: 0; z-index: 50;
   background: var(--inv-bg); color: var(--inv-fg); font-size: 11.5px;
@@ -1257,23 +1450,7 @@ pre.tree-box { white-space: pre; word-break: normal; max-height: 220px; }
             <button id="btn-copy-endpoint">[ COPY ENDPOINT ]</button>
           </div>
           <div class="hint">需要先安装 Tampermonkey。从本页安装会自动注入当前端口与 <code>X-P2R-Token</code>。宽松版会在所有网站注入，靠内容里的 <code>===FILE:</code> 判定要不要动作，适配没收录的新站点用。</div>
-          <div class="sites-bar">
-            <span class="site-tag">ChatGPT</span>
-            <span class="site-tag">Claude</span>
-            <span class="site-tag">Gemini</span>
-            <span class="site-tag">AI Studio</span>
-            <span class="site-tag">DeepSeek</span>
-            <span class="site-tag">LMArena</span>
-            <span class="site-tag">Kimi</span>
-            <span class="site-tag">通义 / Qwen</span>
-            <span class="site-tag">腾讯元宝</span>
-            <span class="site-tag">豆包</span>
-            <span class="site-tag">Copilot</span>
-            <span class="site-tag">Poe</span>
-            <span class="site-tag">Grok</span>
-            <span class="site-tag">Perplexity</span>
-            <span class="site-tag">OpenRouter</span>
-          </div>
+          <div class="hint" style="margin-top:8px">已适配 ChatGPT / Claude / Gemini / AI Studio / DeepSeek / Kimi / 通义 / 元宝 / 豆包 / Copilot / Poe / Grok / Perplexity 等 28 个站点。脚本默认要求回复末尾出现 <code>P2R-READY</code> 才自动落地，防止页面里的引用和复述被误判。</div>
         </div>
       </section>
 
@@ -1298,6 +1475,7 @@ pre.tree-box { white-space: pre; word-break: normal; max-height: 220px; }
             <button class="sm" id="btn-backup-mode">[ BACKUP: LAST ]</button>
             <button class="sm" id="btn-auto-open">[ AUTO-OPEN: STATIC ]</button>
             <button class="sm" id="btn-static-open">[ STATIC: SERVER ]</button>
+            <button class="sm" id="btn-project-mode">[ PROJECT: AUTO ]</button>
           </div>
           <div class="hint" style="margin-top:6px">BACKUP 切 LAST 只留最近一份备份，多轮修复不会把磁盘堆满；OFF 完全不备份。AUTO-OPEN 控制落地后要不要帮你打开页面。STATIC 为 SERVER 时会用内置 http.server 起本地服务再开（ES module / fetch 才跑得起来），FILE 则直接 file:// 打开。</div>
           <div class="sec-grid">
@@ -1331,24 +1509,6 @@ pre.tree-box { white-space: pre; word-break: normal; max-height: 220px; }
     <div class="col">
       <section class="panel">
         <div class="panel-head">
-          <div class="panel-title"><span class="idx">04 //</span>MANUAL APPLY // DRY-RUN</div>
-          <button class="sm" id="btn-load-sample">[ LOAD SAMPLE ]</button>
-        </div>
-        <div class="panel-body">
-          <textarea id="paste-input" placeholder="直接粘贴包含 ===FILE: 路径=== 的 AI 回复文本，支持试运行预览或直接落盘…"></textarea>
-          <div class="row" style="margin-top:10px;justify-content:space-between">
-            <div class="row">
-              <button id="btn-dry-run">[ DRY-RUN PREVIEW ]</button>
-              <button class="primary" id="btn-apply-now">[ APPLY TO DISK ]</button>
-            </div>
-            <button class="sm" id="btn-clear-paste">[ CLEAR ]</button>
-          </div>
-          <pre class="box" id="apply-output" style="display:none"></pre>
-        </div>
-      </section>
-
-      <section class="panel">
-        <div class="panel-head">
           <div class="panel-title"><span class="idx">05 //</span>PROJECT TREE</div>
           <div class="row" style="gap:6px">
             <span id="tree-count" style="font-size:11px;color:var(--fg-dim)">—</span>
@@ -1371,6 +1531,7 @@ pre.tree-box { white-space: pre; word-break: normal; max-height: 220px; }
             <button class="sm" id="btn-open-project">[ ◎ OPEN PROJECT ]</button>
             <button class="sm" id="btn-stop-server">[ ■ STOP SERVER ]</button>
             <button class="sm" id="btn-rollback">[ ↩ ROLLBACK ]</button>
+            <button class="sm" id="btn-export">[ ⤓ EXPORT MD ]</button>
             <span id="dev-state" style="font-size:11px;color:var(--fg-dim);align-self:center">SERVER: OFF</span>
           </div>
           <div class="hint" style="margin-bottom:10px">静态页直接开；带 dev server 的项目会后台起服务再开，不用自己去目录里点 index.html。</div>
@@ -1387,6 +1548,27 @@ pre.tree-box { white-space: pre; word-break: normal; max-height: 220px; }
           </div>
         </div>
       </section>
+
+      <details class="panel">
+        <summary class="panel-head" style="cursor:pointer;list-style:none">
+          <div class="panel-title"><span class="idx">07 //</span>手动落地 / 试运行</div>
+          <span style="color:var(--fg-dim);font-size:11px">点击展开</span>
+        </summary>
+        <div class="panel-body">
+          <div class="row" style="margin-bottom:8px">
+            <button class="sm" id="btn-load-sample">[ LOAD SAMPLE ]</button>
+          </div>
+          <textarea id="paste-input" placeholder="直接粘贴包含 ===FILE: 路径=== 的 AI 回复文本，支持试运行预览或直接落盘…"></textarea>
+          <div class="row" style="margin-top:10px;justify-content:space-between">
+            <div class="row">
+              <button id="btn-dry-run">[ DRY-RUN PREVIEW ]</button>
+              <button class="primary" id="btn-apply-now">[ APPLY TO DISK ]</button>
+            </div>
+            <button class="sm" id="btn-clear-paste">[ CLEAR ]</button>
+          </div>
+          <pre class="box" id="apply-output" style="display:none"></pre>
+        </div>
+      </details>
     </div>
   </main>
 </div>
@@ -1415,19 +1597,25 @@ pre.tree-box { white-space: pre; word-break: normal; max-height: 220px; }
 `输出格式严格要求：
 每个文件用 ===FILE: 相对路径=== 开头，下面给该文件的完整内容，不要省略号，不要"其余同上"。
 不要在文件内容里再嵌套 ===FILE: 这样的行。
-启动命令不是必填项：只有你确定某条命令能跑起来时，才在最后用 ===RUN=== 给一条；
-不确定就省略这一段，本地工具会自己判断怎么运行。`,
+
+如果是新项目，第一行先给 ===PROJECT: 英文小写项目名===；同一项目后续修改沿用同名，不要换。
+启动命令不是必填项：只有你确定某条命令能跑起来时，才在最后用 ===RUN=== 给一条；不确定就省略。
+全部给完后，最后单独一行输出 P2R-READY；只是讨论、片段或没写完时不要输出这个标记。`,
     strict:
 `STRICT OUTPUT PROTOCOL (Paste2Run):
 1. Output ONLY ===FILE: relative/path=== sections, plus an OPTIONAL ===RUN=== section.
 2. Provide complete, runnable file contents with ZERO omissions or placeholders.
 3. Do NOT add explanations after closing code fences.
 4. Keep paths relative (no leading /, no .., no .git/ or .p2r/).
-5. ===RUN=== is optional: include it only when you are certain of the exact command. Omit it rather than guessing.`,
+5. For a new project, start with ===PROJECT: lowercase-name=== and reuse the same name on later edits.
+6. ===RUN=== is optional: include it only when you are certain of the exact command.
+7. When the whole project is complete, end with a single line: P2R-READY. Never emit it for partial work or discussion.`,
     patch:
 `请仅输出本次需要修改或新增的文件：
 每个文件以 ===FILE: 相对路径=== 开头并给出完整文件内容（不要 diff 片段，不要省略号）。
-只有确定构建或启动命令时才附加 ===RUN=== 段，不确定就不要硬编。`
+沿用该项目的 ===PROJECT: 名称===，不确定就不用写。
+只有确定构建或启动命令时才附加 ===RUN=== 段。
+改完后最后单独一行输出 P2R-READY。`
   };
   const SAMPLE_REPLY = `===FILE: index.html===
 \`\`\`html
@@ -1479,6 +1667,8 @@ echo "Paste2Run OK"`;
     if (ao) ao.textContent = "[ AUTO-OPEN: " + String(curState.auto_open || "static").toUpperCase() + " ]";
     const so = $("#btn-static-open");
     if (so) so.textContent = "[ STATIC: " + String(curState.static_open || "server").toUpperCase() + " ]";
+  const pm = $("#btn-project-mode");
+  if (pm) pm.textContent = "[ PROJECT: " + String(curState.project_mode || "auto").toUpperCase() + " ]";
   }
 
   async function cycleSetting(key, seq) {
@@ -1625,6 +1815,23 @@ echo "Paste2Run OK"`;
   $("#btn-backup-mode").addEventListener("click", () => cycleSetting("backup_mode", ["last", "off", "stamp"]));
   $("#btn-auto-open").addEventListener("click", () => cycleSetting("auto_open", ["static", "always", "off"]));
   $("#btn-static-open").addEventListener("click", () => cycleSetting("static_open", ["server", "file"]));
+  $("#btn-project-mode").addEventListener("click", () => cycleSetting("project_mode", ["auto", "always-new", "single"]));
+  $("#btn-export").addEventListener("click", async () => {
+    try {
+      const r = await fetch("/export", { method: "POST", headers: H(), body: "{}" });
+      const j = await r.json();
+      if (!j.ok) return toast("导出失败: " + (j.error || ""));
+      const blob = new Blob([j.markdown || ""], { type: "text/markdown;charset=utf-8" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = j.filename || "workflow.md";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(a.href), 3000);
+      toast("已导出 " + (j.filename || "workflow.md"));
+    } catch (e) { toast("导出失败: " + e.message); }
+  });
   const onToggleRun = () => saveConfig(!curState.allow_run);
   $("#toggle-run").addEventListener("click", onToggleRun);
   $("#toggle-run").addEventListener("keydown", (e) => { if (e.key === " " || e.key === "Enter") { e.preventDefault(); onToggleRun(); } });
@@ -1899,7 +2106,7 @@ class Handler(BaseHTTPRequestHandler):
             last = None
             dev = None
             if target:
-                troot = os.path.abspath(os.path.expanduser(target))
+                troot = resolve_root(os.path.abspath(os.path.expanduser(target)))
                 lp = os.path.join(troot, ".p2r", "last-apply.json")
                 if os.path.exists(lp):
                     try:
@@ -1913,11 +2120,12 @@ class Handler(BaseHTTPRequestHandler):
                                     "backup_mode": cfg.get("backup_mode"),
                                     "auto_open": cfg.get("auto_open"),
                                     "static_open": cfg.get("static_open"),
+                                    "project_mode": cfg.get("project_mode"),
                                     "devServer": dev, "last": last})
 
         if path == "/config":
             pub = {k: cfg.get(k) for k in ("target", "allow_run", "backup_mode",
-                                            "auto_open", "static_open")}
+                                            "auto_open", "static_open", "project_mode")}
             pub.update({"ok": True, "version": VERSION, "port": _CURRENT_PORT[0]})
             return self._json(200, pub)
 
@@ -1925,7 +2133,7 @@ class Handler(BaseHTTPRequestHandler):
             target = cfg.get("target")
             if not target:
                 return self._json(400, {"ok": False, "error": "没有目标目录"})
-            root = os.path.abspath(os.path.expanduser(target))
+            root = resolve_root(os.path.abspath(os.path.expanduser(target)))
             return self._json(200, {"ok": True, "target": root, "tree": project_tree(root)})
 
         self._json(404, {"ok": False, "error": "not found"})
@@ -1954,32 +2162,42 @@ class Handler(BaseHTTPRequestHandler):
                 cfg["auto_open"] = body["auto_open"]
             if body.get("static_open") in ("server", "file"):
                 cfg["static_open"] = body["static_open"]
+            if body.get("project_mode") in ("auto", "single", "always-new"):
+                cfg["project_mode"] = body["project_mode"]
             os.makedirs(os.path.expanduser(cfg["target"]), exist_ok=True)
             save_config(cfg)
             return self._json(200, {"ok": True, "target": cfg["target"],
                                     "allow_run": cfg["allow_run"],
                                     "backup_mode": cfg["backup_mode"],
                                     "auto_open": cfg["auto_open"],
-                                    "static_open": cfg["static_open"]})
+                                    "static_open": cfg["static_open"],
+                                    "project_mode": cfg.get("project_mode")})
 
         target = body.get("target") or cfg.get("target")
         if not target:
             return self._json(400, {"ok": False, "error": "没有目标目录，先在设置页填一个"})
         root = os.path.abspath(os.path.expanduser(target))
+        # auto 模式下项目可能在子目录，接口统一用真实项目目录
+        proj_root = resolve_root(root)
+
+        if path == "/export":
+            md = export_workflow(proj_root)
+            name = "workflow-%s.md" % time.strftime("%Y%m%d-%H%M%S")
+            return self._json(200, {"ok": True, "filename": name, "markdown": md})
 
         if path == "/open":
-            res = open_project(root, allow_run=bool(cfg.get("allow_run")))
+            res = open_project(proj_root, allow_run=bool(cfg.get("allow_run")))
             res["target"] = root
             code = 200 if res.get("ok") else (403 if res.get("blocked") else 422)
             return self._json(code, res)
 
         if path == "/stop":
-            res = stop_dev_server(root)
+            res = stop_dev_server(proj_root)
             res["target"] = root
             return self._json(200 if res.get("ok") else 404, res)
 
         if path == "/rollback":
-            res = rollback_last(root)
+            res = rollback_last(proj_root)
             res["target"] = root
             return self._json(200 if res.get("ok") else 422, res)
 
@@ -2004,10 +2222,10 @@ class Handler(BaseHTTPRequestHandler):
                 })
             if not cfg.get("allow_run"):
                 return self._json(403, {"ok": False, "error": "执行命令未启用，先在设置页勾选「自动执行」"})
-            plan = minimal_run_plan(root)
+            plan = minimal_run_plan(proj_root)
             cmds = body.get("commands")
             if not cmds:
-                last = os.path.join(root, ".p2r", "last-apply.json")
+                last = os.path.join(proj_root, ".p2r", "last-apply.json")
                 if os.path.exists(last):
                     try:
                         with open(last, encoding="utf-8") as fh:
@@ -2021,7 +2239,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"ok": True, "skipped": True, "target": root,
                                         "plan": plan,
                                         "reason": "没有 ===RUN===，也没推断出可执行命令，已跳过"})
-            res = run_pipeline(root, cmds)
+            res = run_pipeline(proj_root, cmds)
             res["target"] = root
             res["plan"] = plan
             if res.get("longRunning"):
@@ -2052,9 +2270,10 @@ class Handler(BaseHTTPRequestHandler):
         result = apply_text(body.get("text") or "", target,
                             dry_run=bool(body.get("dryRun")),
                             source=body.get("source") or "web")
-        result["target"] = root
+        result["base"] = root
+        real_root = result.get("target") or root
         if result.get("ok"):
-            plan = minimal_run_plan(root)
+            plan = minimal_run_plan(real_root)
             result["plan"] = plan
             # 纯静态项目：不管有没有 ===RUN=== 都直接把页面跑起来；
             # 只有 RUN 本身就是长驻服务时才交给 /run 处理
@@ -2066,7 +2285,7 @@ class Handler(BaseHTTPRequestHandler):
                     or (plan.get("kind") == "static" and not looks_long_running(run_cmd))
                 )
                 if want and _should_open(entry):
-                    result["open"] = open_static(root, entry)
+                    result["open"] = open_static(real_root, entry)
         return self._json(200 if result.get("ok") else 422, result)
 
 
@@ -2407,13 +2626,31 @@ npm install && npm run dev
             i4 = detect_project(tmp3)
             assert i4["kind"] == "static", i4
 
+        # ===PROJECT=== 既当分隔符又提取名字
+        proj_txt = "===PROJECT: demo-app===\n===FILE: a.js===\n1\n===RUN===\necho x\n"
+        assert parse_project(proj_txt) == "demo-app"
+        pf, pr = parse(proj_txt)
+        assert len(pf) == 1 and pf[0][1].strip() == "1", pf
+        assert pr == "echo x", pr
+
+        # 项目隔离：文件重合度高算同一项目，全不同就新开目录
+        with tempfile.TemporaryDirectory() as pbase:
+            r1 = apply_text("===FILE: index.html===\nA\n===FILE: app.js===\nB\n", pbase)
+            assert os.path.abspath(r1["target"]) == os.path.abspath(pbase), r1["target"]
+            r2 = apply_text("===FILE: index.html===\nA2\n===FILE: app.js===\nB2\n", pbase)
+            assert os.path.abspath(r2["target"]) == os.path.abspath(pbase), r2["target"]
+            r3 = apply_text("===FILE: other.html===\nX\n===FILE: main.py===\nY\n", pbase)
+            assert os.path.abspath(r3["target"]) != os.path.abspath(pbase), r3["target"]
+            r4 = apply_text("===PROJECT: tagged===\n===FILE: z.txt===\n1\n", pbase)
+            assert os.path.basename(r4["target"]) == "tagged", r4["target"]
+
         # update 的版本解析
         assert _repo_version('VERSION = "0.4.4"\n') == "0.4.4"
         assert _ver_tuple("0.4.4") > _ver_tuple("0.4.3")
         assert _ver_tuple("unknown") == ()
 
     print("selftest ok: 解析 / 围栏与尾随结语 / 乱序RUN / 加粗标记 / 越界与.git拦截 / IPv6 Host /"
-          " 覆写备份(last不膨胀) / 报错归因 / 项目探测 全部通过")
+          " 覆写备份(last不膨胀) / 报错归因 / 项目探测 / 项目隔离 全部通过")
 
 
 def main():

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Paste2Run
 // @namespace    https://local.p2r
-// @version      0.4.3
+// @version      0.4.5
 // @updateURL    __P2R_ENDPOINT__/p2r.user.js
 // @downloadURL  __P2R_ENDPOINT__/p2r.user.js
 // @description  网页 AI 回复完成后，自动把 ===FILE:=== 段落落地成本地项目文件
@@ -53,11 +53,15 @@
     dry: "p2r_dry",
     run: "p2r_run",
     lastHash: "p2r_last",
+    gate: "p2r_gate",
   };
 
   const get = (k, d) => localStorage.getItem(k) ?? d;
   const set = (k, v) => localStorage.setItem(k, v);
   const autoOn = () => get(LS.auto, "1") === "1";
+  // 门禁：AI 必须在最后输出 P2R-READY 才自动落地，防止网页里复述/引用被误判
+  const GATE = /P2R[-_\s]?READY/i;
+  const gateOn = () => get(LS.gate, "1") === "1";
   const dryOn = () => get(LS.dry, "0") === "1";
 
   // 站点选择器只是「候选来源」，真正的判定靠内容（见 findTarget）
@@ -267,6 +271,13 @@
     }
     const h = hash(text);
     if (!opts.force && get(LS.lastHash) === h) return;
+    if (!opts.force && gateOn() && !GATE.test(text)) {
+      // 没看到门禁标记：不自动落地，也不写 lastHash，等 AI 补上标记后还能重试
+      if (!opts.silent) {
+        toast("[P2R] 没看到 P2R-READY 标记，不自动落地\n手动点 [ P2R: APPLY ] 可以强制", 5000);
+      }
+      return;
+    }
     // 失败后退避 60 秒，避免 MutationObserver 刷出一连串无效重试；手动点击不受限
     if (!opts.force && Date.now() - lastFailAt < 60000) return;
 
@@ -380,6 +391,12 @@
     const v = autoOn() ? "0" : "1";
     set(LS.auto, v);
     toast(v === "1" ? "AUTO_APPLY: ON" : "AUTO_APPLY: OFF");
+  });
+
+  GM_registerMenuCommand("切换门禁标记 P2R-READY（开/关）", () => {
+    const v = gateOn() ? "0" : "1";
+    set(LS.gate, v);
+    toast(v === "1" ? "GATE: ON（需要 P2R-READY 才落地）" : "GATE: OFF（看到 ===FILE: 就落地）");
   });
 
   GM_registerMenuCommand("切换试运行（只解析不写盘）", () => {
