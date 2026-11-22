@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Paste2Run
 // @namespace    https://local.p2r
-// @version      0.4.5
+// @version      0.4.6
 // @updateURL    __P2R_ENDPOINT__/p2r.user.js
 // @downloadURL  __P2R_ENDPOINT__/p2r.user.js
 // @description  网页 AI 回复完成后，自动把 ===FILE:=== 段落落地成本地项目文件

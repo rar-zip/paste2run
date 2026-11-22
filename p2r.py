@@ -35,9 +35,11 @@ import sys
 import threading
 import time
 import urllib.parse
+from functools import partial
+import http.server as _http_server
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.4.5"
+VERSION = "0.4.6"
 HOME = os.path.expanduser("~/.p2r")
 CONFIG = os.path.join(HOME, "config.json")
 LOG = os.path.join(HOME, "p2r.log")
@@ -1015,7 +1017,41 @@ def rollback_last(root):
             "preRollback": os.path.relpath(pre, root), "stamp": stamp}
 
 
-def serve_static(root, entry=None):
+_STATIC_LOCK = threading.Lock()
+_STATIC_SERVERS = {}
+
+
+def _static_inproc(directory):
+    """进程内起一个只读静态服务，端口由系统分配，服务活着就一直可用。"""
+    key = os.path.abspath(directory)
+    with _STATIC_LOCK:
+        srv = _STATIC_SERVERS.get(key)
+        if srv is not None:
+            return srv
+        handler = partial(_http_server.SimpleHTTPRequestHandler, directory=key)
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        srv.daemon_threads = True
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        _STATIC_SERVERS[key] = srv
+        log("static inproc root=%s port=%s" % (key, srv.server_address[1]))
+        return srv
+
+
+def _pick_free_port(lo=8090, hi=8199):
+    """子进程模式下找一个真正能绑的端口。"""
+    import socket
+    for p in range(lo, hi):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sk:
+                sk.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                sk.bind(("127.0.0.1", p))
+            return p
+        except OSError:
+            continue
+    return None
+
+
+def serve_static(root, entry=None, inproc=False):
     """用内置 http.server 起一个只读静态站。
 
     比 file:// 靠谱：ES module、fetch、动态 import 在 file:// 下会被浏览器 CORS 拦，
@@ -1029,13 +1065,23 @@ def serve_static(root, entry=None):
             directory = d
             rel = os.path.basename(entry)
 
-    port = None
-    for p in (8090, 8091, 8092, 8093, 8094, 8095, 8100, 8101):
-        if not _port_open(p, timeout=0.1):
-            port = p
-            break
+    if inproc:
+        try:
+            srv = _static_inproc(directory)
+        except OSError as exc:
+            return {"ok": False, "error": "无法启动静态服务: %s" % exc}
+        url = "http://127.0.0.1:%d/%s" % (srv.server_address[1], rel)
+        try:
+            os.makedirs(os.path.join(root, ".p2r"), exist_ok=True)
+            with open(os.path.join(root, ".p2r", "dev.url"), "w") as fh:
+                fh.write(url)
+        except OSError:
+            pass
+        return {"ok": True, "url": url, "pid": None, "mode": "static-server", "inproc": True}
+
+    port = _pick_free_port()
     if port is None:
-        return {"ok": False, "error": "8090-8101 都被占用了"}
+        return {"ok": False, "error": "8090-8199 都被占用了"}
 
     popen_kw = {
         "cwd": directory,
@@ -1104,14 +1150,14 @@ def open_target(path_or_url):
     return {"ok": True, "url": target}
 
 
-def open_static(root, entry):
+def open_static(root, entry, inproc=False):
     """纯静态项目优先起本地服务再开（ES module / fetch 在 file:// 下会挂），失败回退 file://。"""
     if load_config().get("static_open") == "file":
         res = open_target(entry)
         res["mode"] = "static-file"
         return res
 
-    srv = serve_static(root, entry)
+    srv = serve_static(root, entry, inproc=inproc)
     if srv.get("ok") and srv.get("url"):
         op = open_target(srv["url"])
         return {"ok": bool(op.get("ok")), "mode": "static-server", "url": srv["url"],
@@ -1126,7 +1172,7 @@ def open_static(root, entry):
     return fb
 
 
-def open_project(root, allow_run=False):
+def open_project(root, allow_run=False, inproc=False):
     """按项目类型决定：静态页直接开，需要服务的须在 allow_run 开启时才后台拉起。"""
     info = detect_project(root)
     if info.get("long_running") and info.get("commands"):
@@ -1151,7 +1197,7 @@ def open_project(root, allow_run=False):
                 "output": res.get("output", "")[:1500], "plan": minimal_run_plan(root)}
     entry = info.get("entry")
     if entry:
-        res = open_static(root, entry)
+        res = open_static(root, entry, inproc=inproc)
         res["plan"] = minimal_run_plan(root)
         return res
     return {"ok": False, "error": "这个项目没有可直接打开的入口，需要在终端里手动跑", "plan": minimal_run_plan(root)}
@@ -2186,7 +2232,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"ok": True, "filename": name, "markdown": md})
 
         if path == "/open":
-            res = open_project(proj_root, allow_run=bool(cfg.get("allow_run")))
+            res = open_project(proj_root, allow_run=bool(cfg.get("allow_run")), inproc=True)
             res["target"] = root
             code = 200 if res.get("ok") else (403 if res.get("blocked") else 422)
             return self._json(code, res)
@@ -2285,7 +2331,7 @@ class Handler(BaseHTTPRequestHandler):
                     or (plan.get("kind") == "static" and not looks_long_running(run_cmd))
                 )
                 if want and _should_open(entry):
-                    result["open"] = open_static(real_root, entry)
+                    result["open"] = open_static(real_root, entry, inproc=True)
         return self._json(200 if result.get("ok") else 422, result)
 
 
