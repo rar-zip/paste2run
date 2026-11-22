@@ -20,6 +20,7 @@
   npm install && npm run dev
 """
 import argparse
+import base64
 from collections import deque
 import hmac
 import html
@@ -39,13 +40,13 @@ from functools import partial
 import http.server as _http_server
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.4.6"
+VERSION = "0.4.7"
 HOME = os.path.expanduser("~/.p2r")
 CONFIG = os.path.join(HOME, "config.json")
 LOG = os.path.join(HOME, "p2r.log")
 DEFAULT_PORT = 18765
 DEFAULT_TARGET = os.path.join(os.path.expanduser("~"), "p2r-projects")
-MAX_BODY = 4 * 1024 * 1024
+MAX_BODY = 64 * 1024 * 1024
 PORT_TRIES = 10
 
 FILE_RE = re.compile(r"^[ \t]*(?:\*\*)?===\s*FILE:\s*(.+?)\s*===\s*(?:\*\*)?[ \t]*$", re.M)
@@ -297,6 +298,167 @@ def decide_project_root(base, files, project="", mode="auto"):
         # 第一次落地，根目录还是空的，直接用根目录
         return base, "first-run"
     return os.path.join(base, "proj-" + time.strftime("%Y%m%d-%H%M%S")), "new-%.2f" % best_score
+
+
+MAX_ZIP = 40 * 1024 * 1024
+
+
+def _zip_entries(data):
+    """解开 zip，剥掉公共根目录，返回 [(rel, bytes)]。危险路径直接报错。"""
+    import io
+    import zipfile
+
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(data))
+    except Exception as exc:
+        raise ValueError("不是有效 zip: %s" % exc)
+
+    raw = [n for n in zf.namelist() if not n.endswith("/")]
+    if not raw:
+        raise ValueError("zip 里没有文件")
+
+    names = []
+    for n in raw:
+        p = n.replace("\\", "/")
+        if p.startswith("/") or re.match(r"^[a-zA-Z]:", p):
+            raise ValueError("zip 里有绝对路径: %s" % n)
+        if any(part == ".." for part in p.split("/")):
+            raise ValueError("zip 里有越界路径: %s" % n)
+        names.append(p)
+
+    tops = {p.split("/")[0] for p in names}
+    prefix = ""
+    if len(tops) == 1 and all("/" in p for p in names):
+        prefix = tops.pop() + "/"
+
+    out = []
+    for n in names:
+        rel = n[len(prefix):] if prefix and n.startswith(prefix) else n
+        if not rel or rel.startswith("__MACOSX/") or rel.endswith(".DS_Store"):
+            continue
+        try:
+            out.append((rel, zf.read(n)))
+        except Exception:
+            continue
+    if not out:
+        raise ValueError("zip 解开后没有可用文件")
+    return out
+
+
+def import_zip(data, target, source="zip", project=None, project_mode=None):
+    """把 zip 解压落地，走和 apply 一样的路径校验、备份与项目隔离。"""
+    if len(data) > MAX_ZIP:
+        return {"ok": False, "error": "zip 超过 %d MB" % (MAX_ZIP // 1024 // 1024)}
+    try:
+        entries = _zip_entries(data)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+
+    cfg = load_config()
+    backup_mode = cfg.get("backup_mode") or "last"
+    base = os.path.abspath(os.path.expanduser(target))
+    os.makedirs(base, exist_ok=True)
+    mode = project_mode if project_mode in ("auto", "single", "always-new") \
+        else (cfg.get("project_mode") or "auto")
+    root, reason = decide_project_root(base, entries, project or "", mode)
+    root = os.path.abspath(os.path.expanduser(root))
+    os.makedirs(root, exist_ok=True)
+
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    bdir = [None]
+    written, skipped = [], []
+
+    def backup_one(rel, full):
+        if backup_mode == "off":
+            return
+        if bdir[0] is None:
+            if backup_mode == "last":
+                d = os.path.join(root, ".p2r", "backup", "last")
+                if os.path.isdir(d):
+                    shutil.rmtree(d, ignore_errors=True)
+                bdir[0] = d
+            else:
+                bdir[0] = os.path.join(root, ".p2r", "backup", stamp)
+        bp = os.path.join(bdir[0], rel.replace("/", os.sep))
+        os.makedirs(os.path.dirname(bp), exist_ok=True)
+        shutil.copy2(full, bp)
+
+    for rel, content in entries:
+        try:
+            full = safe_target(root, rel)
+        except ValueError as exc:
+            skipped.append({"path": rel, "reason": str(exc)})
+            continue
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        if os.path.exists(full):
+            backup_one(rel, full)
+        with open(full, "wb") as fh:
+            fh.write(content)
+        written.append({"path": rel, "bytes": len(content)})
+
+    manifest = {
+        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "source": source,
+        "target": root,
+        "base": base,
+        "project": (os.path.basename(root) if root != base else ""),
+        "rootReason": reason,
+        "files": written,
+        "skipped": skipped,
+        "run": "",
+        "backupMode": backup_mode,
+    }
+    os.makedirs(os.path.join(root, ".p2r"), exist_ok=True)
+    with open(os.path.join(root, ".p2r", "last-apply.json"), "w", encoding="utf-8") as fh:
+        json.dump(manifest, fh, ensure_ascii=False, indent=2)
+    if root != base:
+        try:
+            os.makedirs(os.path.join(base, ".p2r"), exist_ok=True)
+            with open(os.path.join(base, ".p2r", "last-target"), "w", encoding="utf-8") as fh:
+                fh.write(root)
+        except OSError:
+            pass
+    log("import-zip source=%s root=%s files=%d skipped=%d" % (source, root, len(written), len(skipped)))
+    return {"ok": True, "base": base, **manifest}
+
+
+def _host_is_private(host):
+    import ipaddress
+    import socket
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except OSError:
+        return True
+    for info in infos:
+        ip = info[4][0]
+        try:
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            return True
+        if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved:
+            return True
+    return False
+
+
+def fetch_zip(url, target, timeout=60):
+    """服务端代下 zip（油猴拦截下载链接时用）。只允许公网 http(s)。"""
+    import urllib.parse
+    import urllib.request
+
+    p = urllib.parse.urlparse(url or "")
+    if p.scheme not in ("http", "https"):
+        return {"ok": False, "error": "只支持 http/https 链接"}
+    if not p.hostname or _host_is_private(p.hostname):
+        return {"ok": False, "error": "拒绝内网或非法主机名"}
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Paste2Run/%s" % VERSION})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = resp.read(MAX_ZIP + 1)
+    except Exception as exc:
+        return {"ok": False, "error": "下载失败: %s" % exc}
+    if len(data) > MAX_ZIP:
+        return {"ok": False, "error": "文件超过 %d MB" % (MAX_ZIP // 1024 // 1024)}
+    return import_zip(data, target, source="zip-url")
 
 
 def export_workflow(root):
@@ -1613,6 +1775,14 @@ pre.tree-box { white-space: pre; word-break: normal; max-height: 220px; }
             <button class="sm" id="btn-clear-paste">[ CLEAR ]</button>
           </div>
           <pre class="box" id="apply-output" style="display:none"></pre>
+
+          <div class="row" style="margin-top:14px;justify-content:space-between">
+            <span style="font-size:11.5px;color:var(--fg-dim)">平台直接给 zip 时，从这里导入</span>
+            <button class="sm" id="btn-pick-zip">[ 选择 ZIP ]</button>
+          </div>
+          <div id="zip-drop" style="margin-top:8px;padding:16px;border:1px dashed var(--border);text-align:center;font-size:12px;color:var(--fg-dim);cursor:pointer">把 zip 拖到这里</div>
+          <input type="file" id="zip-file" accept=".zip,application/zip" style="display:none">
+          <pre class="box" id="zip-output" style="display:none"></pre>
         </div>
       </details>
     </div>
@@ -1888,6 +2058,59 @@ echo "Paste2Run OK"`;
   $("#btn-dry-run").addEventListener("click", () => submitApply(true));
   $("#btn-apply-now").addEventListener("click", () => submitApply(false));
   $("#btn-clear-paste").addEventListener("click", () => { $("#paste-input").value = ""; $("#apply-output").style.display = "none"; });
+
+  async function importZip(file) {
+    if (!file) return;
+    if (!/\.zip$/i.test(file.name || "")) return toast("只支持 .zip 文件");
+    const out = $("#zip-output");
+    out.style.display = "block";
+    out.textContent = "读取 " + file.name + " …";
+    const b64 = await new Promise((res, rej) => {
+      const fr = new FileReader();
+      fr.onload = () => {
+        const r = String(fr.result || "");
+        const i = r.indexOf(",");
+        res(i >= 0 ? r.slice(i + 1) : "");
+      };
+      fr.onerror = () => rej(new Error("读取文件失败"));
+      fr.readAsDataURL(file);
+    });
+    out.textContent = "上传并解压中…";
+    try {
+      const r = await fetch("/import-zip", {
+        method: "POST", headers: H(),
+        body: JSON.stringify({ zip: b64, source: "zip-upload" }),
+      });
+      const j = await r.json();
+      if (!j.ok) { out.textContent = "[FAIL] " + (j.error || "未知错误"); return; }
+      const list = (j.files || []).map((f) => "  + " + f.path).slice(0, 20).join("\n");
+      out.textContent = "解压 " + (j.files || []).length + " 个文件 -> " + j.target + "\n" + list +
+        ((j.files || []).length > 20 ? "\n  …共 " + j.files.length + " 个" : "") +
+        ((j.skipped || []).length ? "\n  ! 跳过 " + j.skipped.length + " 个危险路径" : "");
+      toast("ZIP 导入完成: " + (j.files || []).length + " 个文件", 6000);
+      try { await loadState(); await loadTree(); } catch (e) {}
+    } catch (e) {
+      out.textContent = "[ERR] " + e.message;
+    }
+  }
+
+  $("#btn-pick-zip").addEventListener("click", () => $("#zip-file").click());
+  $("#zip-file").addEventListener("change", (e) => {
+    const f = e.target.files && e.target.files[0];
+    e.target.value = "";
+    importZip(f);
+  });
+  const drop = $("#zip-drop");
+  ["dragenter", "dragover"].forEach((ev) => drop.addEventListener(ev, (e) => {
+    e.preventDefault(); drop.style.borderColor = "var(--border-hi)";
+  }));
+  ["dragleave", "drop"].forEach((ev) => drop.addEventListener(ev, (e) => {
+    e.preventDefault(); drop.style.borderColor = "var(--border)";
+  }));
+  drop.addEventListener("drop", (e) => {
+    const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+    importZip(f);
+  });
 
   document.querySelectorAll("button.tab[data-preset]").forEach((btn) => {
     btn.addEventListener("click", () => {
@@ -2225,6 +2448,24 @@ class Handler(BaseHTTPRequestHandler):
         root = os.path.abspath(os.path.expanduser(target))
         # auto 模式下项目可能在子目录，接口统一用真实项目目录
         proj_root = resolve_root(root)
+
+        if path == "/import-zip":
+            b64 = body.get("zip") or ""
+            try:
+                data = base64.b64decode(b64, validate=False)
+            except Exception:
+                return self._json(400, {"ok": False, "error": "zip 内容不是合法 base64"})
+            res = import_zip(data, target,
+                             source=body.get("source") or "zip-upload",
+                             project=body.get("project"),
+                             project_mode=body.get("project_mode"))
+            res["base"] = root
+            return self._json(200 if res.get("ok") else 422, res)
+
+        if path == "/fetch-zip":
+            res = fetch_zip(body.get("url") or "", target)
+            res["base"] = root
+            return self._json(200 if res.get("ok") else 422, res)
 
         if path == "/export":
             md = export_workflow(proj_root)

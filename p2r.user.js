@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Paste2Run
 // @namespace    https://local.p2r
-// @version      0.4.6
+// @version      0.4.7
 // @updateURL    __P2R_ENDPOINT__/p2r.user.js
 // @downloadURL  __P2R_ENDPOINT__/p2r.user.js
 // @description  网页 AI 回复完成后，自动把 ===FILE:=== 段落落地成本地项目文件
@@ -432,6 +432,30 @@
       toast(e.message);
     }
   });
+
+  // 平台直接给 zip 下载链接时，拦下来交给本地服务下载并解压
+  document.addEventListener("click", (e) => {
+    if (!gateOn()) return;
+    const a = e.target && e.target.closest ? e.target.closest("a[href]") : null;
+    if (!a) return;
+    const href = a.href || "";
+    if (!/^https?:/i.test(href)) return;   // blob: / data: 拿不到，交给控制台手动拖拽
+    const dl = a.getAttribute("download") || "";
+    if (!/\.zip(\?|#|$)/i.test(href) && !/zip/i.test(dl)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    toast("[P2R] 抓到 zip 链接，下载并解压中…", 5000);
+    post("/fetch-zip", { url: href }, 180000)
+      .then((r) => {
+        if (r.ok) {
+          toast(`[P2R] 解压 ${r.files.length} 个文件 -> ${r.target}`, 7000);
+          if (GM_notification) GM_notification({ text: `Paste2Run 从 zip 导入 ${r.files.length} 个文件`, timeout: 3000 });
+        } else {
+          toast("[P2R] 导入失败: " + (r.error || ""), 7000);
+        }
+      })
+      .catch((err) => toast("[P2R] 导入失败: " + err.message, 7000));
+  }, true);
 
   // 左下角黑白极简 ASCII 悬浮按钮
   function mountButton() {
