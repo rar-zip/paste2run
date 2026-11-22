@@ -37,7 +37,7 @@ import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.4.3"
+VERSION = "0.4.4"
 HOME = os.path.expanduser("~/.p2r")
 CONFIG = os.path.join(HOME, "config.json")
 LOG = os.path.join(HOME, "p2r.log")
@@ -341,7 +341,7 @@ def repair_prompt(root, output, original_mood=""):
         + "\n\n当前项目结构：\n" + tree
         + "\n\n请只输出需要修改或新增的文件，仍然使用 ===FILE: 相对路径=== 格式，"
           "每个文件给完整内容，不要 diff，不要省略号，不要解释。"
-          "如果错误来自缺少依赖，请同时更新 package.json 或给出安装命令放在 ===RUN=== 段。"
+          "只改真正导致报错的文件，不要顺手改无关文件。"
     )
 
 
@@ -947,7 +947,7 @@ def open_project(root, allow_run=False):
                     "opened": opened, "manual": bool(opened.get("manual")), "reused": True}
         if not allow_run:
             return {"ok": False, "mode": "server", "blocked": True,
-                    "error": "该项目需启动本地服务，请先开启「自动执行 ===RUN===」或按下方方案手动运行",
+                    "error": "该项目需启动本地服务，请先开启「自动运行」或按下方方案手动运行",
                     "plan": minimal_run_plan(root)}
         cmd = " && ".join(info["commands"])
         res = run_pipeline(root, cmd)
@@ -1290,7 +1290,7 @@ pre.tree-box { white-space: pre; word-break: normal; max-height: 220px; }
           <div class="toggle-row" id="toggle-run" role="checkbox" aria-checked="false" tabindex="0">
             <span class="toggle-label">
               <span class="ascii-ck" id="run-ck">[ ]</span>
-              <span>落地后自动执行 <code>===RUN===</code> 命令</span>
+              <span>落地后自动尝试运行（有 ===RUN=== 用它，没有就自己推断）</span>
             </span>
             <span id="run-state-tag" style="font-size:11px;color:var(--fg-dim)">SAFE: OFF</span>
           </div>
@@ -1414,18 +1414,20 @@ pre.tree-box { white-space: pre; word-break: normal; max-height: 220px; }
     std:
 `输出格式严格要求：
 每个文件用 ===FILE: 相对路径=== 开头，下面给该文件的完整内容，不要省略号，不要"其余同上"。
-所有文件给完后，用 ===RUN=== 开头给出启动命令。
-不要在文件内容里再嵌套 ===FILE: 这样的行。`,
+不要在文件内容里再嵌套 ===FILE: 这样的行。
+启动命令不是必填项：只有你确定某条命令能跑起来时，才在最后用 ===RUN=== 给一条；
+不确定就省略这一段，本地工具会自己判断怎么运行。`,
     strict:
 `STRICT OUTPUT PROTOCOL (Paste2Run):
-1. Output ONLY ===FILE: relative/path=== sections and one optional ===RUN=== section.
+1. Output ONLY ===FILE: relative/path=== sections, plus an OPTIONAL ===RUN=== section.
 2. Provide complete, runnable file contents with ZERO omissions or placeholders.
 3. Do NOT add explanations after closing code fences.
-4. Keep paths relative (no leading /, no .., no .git/ or .p2r/).`,
+4. Keep paths relative (no leading /, no .., no .git/ or .p2r/).
+5. ===RUN=== is optional: include it only when you are certain of the exact command. Omit it rather than guessing.`,
     patch:
 `请仅输出本次需要修改或新增的文件：
 每个文件以 ===FILE: 相对路径=== 开头并给出完整文件内容（不要 diff 片段，不要省略号）。
-如需新增依赖或重新构建，请在最后附加 ===RUN=== 段给出命令。`
+只有确定构建或启动命令时才附加 ===RUN=== 段，不确定就不要硬编。`
   };
   const SAMPLE_REPLY = `===FILE: index.html===
 \`\`\`html
@@ -2002,6 +2004,7 @@ class Handler(BaseHTTPRequestHandler):
                 })
             if not cfg.get("allow_run"):
                 return self._json(403, {"ok": False, "error": "执行命令未启用，先在设置页勾选「自动执行」"})
+            plan = minimal_run_plan(root)
             cmds = body.get("commands")
             if not cmds:
                 last = os.path.join(root, ".p2r", "last-apply.json")
@@ -2011,8 +2014,13 @@ class Handler(BaseHTTPRequestHandler):
                             cmds = json.load(fh).get("run") or ""
                     except Exception:
                         cmds = ""
-            # 先用静态推断补全安装步骤，但 ===RUN=== 里用户自己的命令优先
-            plan = minimal_run_plan(root)
+            # AI 没给 ===RUN=== 时，用项目结构推断出来的命令自己跑，别干等着
+            if not cmds:
+                cmds = " && ".join(plan.get("commands") or [])
+            if not cmds:
+                return self._json(200, {"ok": True, "skipped": True, "target": root,
+                                        "plan": plan,
+                                        "reason": "没有 ===RUN===，也没推断出可执行命令，已跳过"})
             res = run_pipeline(root, cmds)
             res["target"] = root
             res["plan"] = plan
@@ -2155,6 +2163,133 @@ def cmd_doctor():
     return 0 if ok else 1
 
 
+REPO_SLUG = "rar-zip/paste2run"
+MIRROR_PREFIXES = (
+    "https://gh-proxy.com/",
+    "https://ghfast.top/",
+    "https://ghproxy.net/",
+)
+# update 只碰这些文件，配置 .p2r/ 和用户自己的项目目录一律不碰
+UPDATE_FILES = ("p2r.py", "p2r.user.js", "README.md",
+                "start.sh", "start.bat", "start.command", "LICENSE")
+
+
+def _download(urls, timeout=25):
+    """按顺序试下载，返回 (bytes, used_url, errors)。"""
+    import urllib.request
+
+    errors = []
+    for url in urls:
+        try:
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "Paste2Run/%s" % VERSION})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = resp.read()
+            if data[:2] == b"PK":
+                return data, url, errors
+            errors.append("%s: 不是 zip（前 2 字节 %r）" % (url, data[:2]))
+        except Exception as exc:
+            errors.append("%s: %s" % (url, exc))
+    return None, "", errors
+
+
+def _repo_version(blob):
+    m = re.search(r'^VERSION\s*=\s*["\']([^"\']+)["\']', blob, re.M)
+    return m.group(1) if m else ""
+
+
+def _ver_tuple(v):
+    parts = re.findall(r"\d+", v or "")
+    return tuple(int(x) for x in parts) if parts else ()
+
+
+def cmd_update(check_only=False, tag=None, mirror=False, force=False):
+    """从 GitHub 拉最新源码，只覆盖代码文件，备份旧版。"""
+    import io
+    import zipfile
+
+    ref = (tag or "main")
+    if tag and not tag.startswith("v"):
+        ref = "v" + tag
+    kind = "tags" if tag else "heads"
+    direct = "https://github.com/%s/archive/refs/%s/%s.zip" % (REPO_SLUG, kind, ref)
+    if mirror:
+        urls = [p + direct for p in MIRROR_PREFIXES] + [direct]
+    else:
+        urls = [direct] + [p + direct for p in MIRROR_PREFIXES]
+
+    print("Paste2Run 更新器")
+    print("当前版本: %s" % VERSION)
+    print("目标: %s" % direct)
+    blob, used, errors = _download(urls)
+    if blob is None:
+        print("✗ 所有下载地址都失败了:")
+        for e in errors:
+            print("  " + e)
+        print("  可以指定版本重试: python3 p2r.py update --tag v0.4.4")
+        return 1
+    if errors:
+        print("（前 %d 个地址没通，换到可用的那个）" % len(errors))
+    print("下载成功: %s" % used)
+
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(blob))
+    except Exception as exc:
+        print("✗ 下载内容不是有效 zip: %s" % exc)
+        return 1
+
+    prefix = ""
+    for name in zf.namelist():
+        if name.count("/") == 1 and name.endswith("/p2r.py"):
+            prefix = name[:-len("p2r.py")]
+            break
+    if not prefix:
+        print("✗ 压缩包里找不到 p2r.py，放弃")
+        return 1
+
+    new_src = zf.read(prefix + "p2r.py").decode("utf-8", "replace")
+    new_ver = _repo_version(new_src) or "unknown"
+    print("远端版本: %s" % new_ver)
+
+    if not force and _ver_tuple(new_ver) and _ver_tuple(VERSION):
+        if _ver_tuple(new_ver) <= _ver_tuple(VERSION):
+            print("已经是最新的，不用更新")
+            return 0
+    if check_only:
+        print("有可用更新: %s -> %s" % (VERSION, new_ver))
+        print("去掉 --check 即可安装")
+        return 0
+
+    dest = os.path.dirname(os.path.abspath(__file__))
+    bakdir = os.path.join(dest, ".p2r-update-bak-%s" % time.strftime("%Y%m%d-%H%M%S"))
+    os.makedirs(bakdir, exist_ok=True)
+
+    written, missed = [], []
+    for name in UPDATE_FILES:
+        try:
+            data = zf.read(prefix + name)
+        except KeyError:
+            missed.append(name)
+            continue
+        target = os.path.join(dest, name)
+        if os.path.exists(target):
+            shutil.copy2(target, os.path.join(bakdir, name))
+        with open(target, "wb") as fh:
+            fh.write(data)
+        written.append(name)
+
+    print("已覆盖: %s" % ", ".join(written))
+    if missed:
+        print("包里没有，已跳过: %s" % ", ".join(missed))
+    print("旧文件备份: %s" % bakdir)
+    print("")
+    print("%s -> %s 完成" % (VERSION, new_ver))
+    print("下一步:")
+    print("  1. 关掉当前 p2r 窗口，重新运行 start 脚本（服务要重启才用新 p2r.py）")
+    print("  2. 打开 http://127.0.0.1:%s/ 按页面提示重装一次油猴脚本" % DEFAULT_PORT)
+    return 0
+
+
 def cmd_selftest():
     sample = """好的，给你一个最小项目。
 
@@ -2272,6 +2407,11 @@ npm install && npm run dev
             i4 = detect_project(tmp3)
             assert i4["kind"] == "static", i4
 
+        # update 的版本解析
+        assert _repo_version('VERSION = "0.4.4"\n') == "0.4.4"
+        assert _ver_tuple("0.4.4") > _ver_tuple("0.4.3")
+        assert _ver_tuple("unknown") == ()
+
     print("selftest ok: 解析 / 围栏与尾随结语 / 乱序RUN / 加粗标记 / 越界与.git拦截 / IPv6 Host /"
           " 覆写备份(last不膨胀) / 报错归因 / 项目探测 全部通过")
 
@@ -2295,6 +2435,13 @@ def main():
     sub.add_parser("doctor", help="环境自检")
     sub.add_parser("selftest", help="解析自检")
 
+    up = sub.add_parser("update", help="从 GitHub 拉最新版覆盖自己")
+    up.add_argument("--tag", default=None, help="指定版本，如 v0.4.4")
+    up.add_argument("--no-mirror", action="store_true", help="兼容用，已默认直连优先")
+    up.add_argument("--mirror", action="store_true", help="先试国内镜像，再试直连")
+    up.add_argument("--check", action="store_true", help="只检查有没有新版")
+    up.add_argument("--force", action="store_true", help="版本相同时也强制覆盖")
+
     op = sub.add_parser("open", help="按项目类型打开入口（静态页起本地服务再开）")
     op.add_argument("--dir", default=None)
 
@@ -2309,6 +2456,9 @@ def main():
         cmd_apply(args.file, args.dir, args.dry_run)
     elif cmd == "doctor":
         sys.exit(cmd_doctor())
+    elif cmd == "update":
+        sys.exit(cmd_update(check_only=args.check, tag=args.tag,
+                            mirror=bool(args.mirror), force=args.force))
     elif cmd == "open":
         cfg = load_config()
         root = os.path.abspath(os.path.expanduser(args.dir or cfg.get("target")))

@@ -296,10 +296,14 @@
         if (GM_notification) {
           GM_notification({ text: `Paste2Run 写入 ${res.files.length} 个文件`, timeout: 3000 });
         }
-        if (!dryOn() && serverAllowRun && res.run) {
-          toast("[P2R] EXEC ===RUN===…", 4000);
+        if (!dryOn() && serverAllowRun) {
+          toast(res.run ? "[P2R] EXEC ===RUN===…" : "[P2R] AUTO RUN…", 4000);
           post("/run", {}, 300000)
             .then(async (r) => {
+              if (r.ok && r.skipped) {
+                toast("[P2R] 没识别出运行命令，已跳过", 4000);
+                return;
+              }
               if (r.ok) {
                 const where = r.url ? ` -> ${r.url}` : "";
                 toast(`[P2R] RUN OK (${r.duration ?? "?"}s)${where}`, 5000);
