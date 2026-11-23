@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Paste2Run
 // @namespace    https://local.p2r
-// @version      0.4.7
+// @version      0.4.8
 // @updateURL    __P2R_ENDPOINT__/p2r.user.js
 // @downloadURL  __P2R_ENDPOINT__/p2r.user.js
 // @description  网页 AI 回复完成后，自动把 ===FILE:=== 段落落地成本地项目文件
@@ -38,6 +38,7 @@
 // @grant        GM_notification
 // @grant        GM_setClipboard
 // @grant        GM_openInTab
+// @grant        unsafeWindow
 // @connect      127.0.0.1
 // @connect      localhost
 // ==/UserScript==
@@ -433,28 +434,163 @@
     }
   });
 
-  // 平台直接给 zip 下载链接时，拦下来交给本地服务下载并解压
-  document.addEventListener("click", (e) => {
+  // ── zip 自动接管 ──────────────────────────────────────────────
+  // 平台现在常把整站打成 zip 下载。这里三条路都拦：http(s) 直链交给服务端下载、
+  // blob: 链接就地读、页面用 createObjectURL 生成 blob 时也记一笔（按钮触发的下载）。
+  const pageWin = (typeof unsafeWindow !== "undefined" && unsafeWindow) ? unsafeWindow : window;
+  const zipSeen = new Set();
+  const recentZipBlobs = [];
+
+  function looksZipType(t) {
+    return /zip/i.test(t || "");
+  }
+
+  async function isPkBlob(blob) {
+    try {
+      const head = new Uint8Array(await blob.slice(0, 4).arrayBuffer());
+      return head.length >= 4 && head[0] === 0x50 && head[1] === 0x4b &&
+        (head[2] === 0x03 || head[2] === 0x05 || head[2] === 0x07);
+    } catch {
+      return false;
+    }
+  }
+
+  function blobToB64(blob) {
+    return new Promise((res, rej) => {
+      const fr = new FileReader();
+      fr.onload = () => {
+        const r = String(fr.result || "");
+        const i = r.indexOf(",");
+        res(i >= 0 ? r.slice(i + 1) : "");
+      };
+      fr.onerror = () => rej(new Error("读取 blob 失败"));
+      fr.readAsDataURL(blob);
+    });
+  }
+
+  // 不是 zip 的时候原样把下载还回去，别把普通文件的下载链接吞掉
+  // 注意：替身 a 必须打标记，否则它自己又会走一遍拦截，无限递归
+  function replayBlob(a, href) {
+    try {
+      const t = document.createElement("a");
+      t.href = href;
+      t.setAttribute("data-p2r-replay", "1");
+      const dl = a && a.getAttribute ? a.getAttribute("download") : "";
+      if (dl) t.download = dl;
+      t.style.display = "none";
+      document.body.appendChild(t);
+      t.click();
+      t.remove();
+    } catch {}
+  }
+
+  async function importZipBlob(blob, why) {
+    if (!gateOn() || !blob || !blob.size) return;
+    if (blob.size > 40 * 1024 * 1024) return toast("[P2R] zip 超过 40MB，跳过", 5000);
+    if (!(await isPkBlob(blob))) return;
+    try {
+      toast("[P2R] 抓到 zip，正在解压…", 5000);
+      const b64 = await blobToB64(blob);
+      const r = await post("/import-zip", { zip: b64, source: why || "zip-blob" }, 180000);
+      if (r.ok) {
+        toast(`[P2R] 解压 ${r.files.length} 个文件 -> ${r.target}`, 7000);
+        if (GM_notification) {
+          GM_notification({ text: `Paste2Run 从 zip 导入 ${r.files.length} 个文件`, timeout: 3000 });
+        }
+      } else {
+        toast("[P2R] 导入失败: " + (r.error || ""), 7000);
+      }
+    } catch (err) {
+      toast("[P2R] 导入失败: " + err.message, 7000);
+    }
+  }
+
+  // hook 页面自己的 createObjectURL，记住最近生成的 zip blob
+  try {
+    const U = pageWin.URL;
+    const origCreate = U.createObjectURL;
+    if (origCreate && !origCreate.__p2rHook) {
+      const hooked = function (obj) {
+        const url = origCreate.call(U, obj);
+        try {
+          const isBlob = obj && typeof obj.size === "number";
+          if (isBlob && (looksZipType(obj.type) || obj.size > 1024)) {
+            recentZipBlobs.push({ url, blob: obj, at: Date.now(), type: obj.type || "" });
+            while (recentZipBlobs.length > 6) recentZipBlobs.shift();
+          }
+        } catch {}
+        return url;
+      };
+      hooked.__p2rHook = true;
+      U.createObjectURL = hooked;
+    }
+  } catch {}
+
+  document.addEventListener("click", async (e) => {
     if (!gateOn()) return;
     const a = e.target && e.target.closest ? e.target.closest("a[href]") : null;
-    if (!a) return;
-    const href = a.href || "";
-    if (!/^https?:/i.test(href)) return;   // blob: / data: 拿不到，交给控制台手动拖拽
-    const dl = a.getAttribute("download") || "";
-    if (!/\.zip(\?|#|$)/i.test(href) && !/zip/i.test(dl)) return;
-    e.preventDefault();
-    e.stopPropagation();
-    toast("[P2R] 抓到 zip 链接，下载并解压中…", 5000);
-    post("/fetch-zip", { url: href }, 180000)
-      .then((r) => {
-        if (r.ok) {
-          toast(`[P2R] 解压 ${r.files.length} 个文件 -> ${r.target}`, 7000);
-          if (GM_notification) GM_notification({ text: `Paste2Run 从 zip 导入 ${r.files.length} 个文件`, timeout: 3000 });
-        } else {
-          toast("[P2R] 导入失败: " + (r.error || ""), 7000);
-        }
-      })
-      .catch((err) => toast("[P2R] 导入失败: " + err.message, 7000));
+    const href = a ? (a.href || "") : "";
+    const dl = a ? (a.getAttribute("download") || "") : "";
+
+    // 1. blob: 链接，就地读取；验完不是 zip 就还给浏览器，避免误伤普通下载
+    if (/^blob:/i.test(href)) {
+      if (a.hasAttribute("data-p2r-replay")) return;   // 自己补发的下载，别再拦
+      e.preventDefault();
+      e.stopPropagation();
+      if (zipSeen.has(href)) return;
+      let blob = null;
+      try {
+        const resp = await pageWin.fetch(href);
+        blob = await resp.blob();
+      } catch (err) {
+        replayBlob(a, href);
+        return;
+      }
+      if (await isPkBlob(blob)) {
+        zipSeen.add(href);
+        await importZipBlob(blob, "zip-blob-url");
+      } else {
+        replayBlob(a, href);
+      }
+      return;
+    }
+
+    // 2. http(s) 的 zip 直链，交给服务端下载
+    if (/^https?:/i.test(href) && (/\.zip(\?|#|$)/i.test(href) || /zip/i.test(dl))) {
+      e.preventDefault();
+      e.stopPropagation();
+      toast("[P2R] 抓到 zip 链接，下载并解压中…", 5000);
+      post("/fetch-zip", { url: href }, 180000)
+        .then((r) => {
+          if (r.ok) {
+            toast(`[P2R] 解压 ${r.files.length} 个文件 -> ${r.target}`, 7000);
+            if (GM_notification) {
+              GM_notification({ text: `Paste2Run 从 zip 导入 ${r.files.length} 个文件`, timeout: 3000 });
+            }
+          } else {
+            toast("[P2R] 导入失败: " + (r.error || ""), 7000);
+          }
+        })
+        .catch((err) => toast("[P2R] 导入失败: " + err.message, 7000));
+      return;
+    }
+
+    // 3. 没有 a 标签、由按钮触发下载的情况：点击后看有没有新冒出来的 zip blob
+    //    只对文案像「下载 / 导出 / zip」的控件生效，避免普通点击误抓
+    if (!a) {
+      const t = e.target || {};
+      const label = String((t.textContent || "") + " " +
+        (t.getAttribute ? (t.getAttribute("aria-label") || "") + " " + (t.title || "") : "")).slice(0, 60);
+      if (!/zip|下载|download|导出|打包/i.test(label)) return;
+      setTimeout(() => {
+        const now = Date.now();
+        const fresh = recentZipBlobs.filter((b) => now - b.at < 1500 && !zipSeen.has(b.url));
+        if (!fresh.length) return;
+        const last = fresh[fresh.length - 1];
+        zipSeen.add(last.url);
+        importZipBlob(last.blob, "zip-button");
+      }, 350);
+    }
   }, true);
 
   // 左下角黑白极简 ASCII 悬浮按钮
