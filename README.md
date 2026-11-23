@@ -1,7 +1,7 @@
 # Paste2Run
 
 > 网页 AI 写好的代码，直接落进你本地的项目目录。
-> **v0.4.8 · Python 3.8+ · 零第三方依赖 · 黑白极简 ASCII 控制台 · MIT License**
+> **v0.5.0 · Python 3.8+ · 零第三方依赖 · 黑白极简 ASCII 控制台 · MIT License**
 
 在 ChatGPT / Claude / Gemini / DeepSeek / 腾讯元宝 / 豆包里让 AI 生成完整项目时，最耗时间的往往不是写提示词，而是把一整页带文件名的代码逐个新建、复制、粘贴、保存。**Paste2Run** 把这一步变成全自动：AI 回复结束，文件已经在你的工程目录里，可选自动执行构建命令，报错还能一键生成修复提示词。
 
@@ -180,6 +180,21 @@ HTTP 新增 `POST /import-zip`（`{zip: base64}`，控制台拖拽或选择 zip 
 - **体积与格式限制**：单次请求上限 4MB，仅处理纯文本代码，不解析图片或二进制附件。
 
 ## 更新日志
+
+### v0.5.0
+
+- **零 Token 轻量本地 Agent 闭环**：新增 `===TOOL: tree | list_files | read_file | search | status===` 与 `POST /tool`，网页 AI 可按需读本地文件、搜代码、查目录树；油猴脚本自动把 `===TOOL_RESULT===` 或报错修复提示词填回聊天输入框，支持 `SEMI`（填好等你按回车）/ `AUTO`（自动接力，上限 5 步 + Shift+⚙ 急停）/ `OFF` 三档模式。
+- **零摩擦极简悬浮微条**：AI 网页左下角升级为 `[ +P2R | APPLY | OPEN | AGENT:SEMI | ⚙ ]` 微条，点 `+P2R` 直接往输入框注入 Agent 协议，日常无需切回控制台复制提示词。
+- **告别黑框终端**：新增 `python3 p2r.py autostart [--off]`（跨平台配置 Windows/macOS/Linux 静默后台自启）与 Windows 双击无窗启动脚本 `start_silent.vbs`。
+- **内置接力文档**：新增精简版 `HANDOFF.md`，换 AI 或额度耗尽时直接贴给下一个 AI 即可继续。
+- **修复 v0.4.8 全部 7 项实测缺陷**：
+  - `parse()` 自动剥离独立行的 `P2R-READY`，不再污染最后一个文件或被当成 `===RUN===` 命令执行报 127。
+  - `POST /repair` 改为使用隔离后的 `proj_root` 而非父目录 `root`。
+  - `POST /run` 结束后打开静态页改用无缓存内置服务 `open_static(..., inproc=True)`，告别 `file://` CORS 拦截。
+  - `POST /import-zip` 与 `POST /fetch-zip` 补齐静态项目自动打开。
+  - 内置静态服务新增 `Cache-Control: no-store` 且静默日志，改代码重开不吃浏览器旧缓存。
+  - 切回 `single` 模式自动清理过期的 `last-target` 指针。
+  - 油猴 ZIP 拦截与 `P2R-READY` 文本门禁解耦。
 
 ### v0.4.8
 
