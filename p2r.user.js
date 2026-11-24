@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         Paste2Run
 // @namespace    https://local.p2r
-// @version      0.5.0
+// @version      0.5.1
 // @updateURL    __P2R_ENDPOINT__/p2r.user.js
 // @downloadURL  __P2R_ENDPOINT__/p2r.user.js
-// @description  零 Token 网页 AI 轻量 Agent：自动落地 ===FILE:===、执行本地只读 ===TOOL:===、自动回填修复与结果
+// @description  零 Token 网页 AI 轻量 Agent：自动落地 ===FILE:===、安全只读 ===TOOL:===、深度拦截 SPA/LMArena ZIP
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
 // @match        https://claude.ai/*
@@ -14,6 +14,9 @@
 // @match        https://yuanbao.tencent.com/*
 // @match        https://www.doubao.com/*
 // @match        https://lmarena.ai/*
+// @match        https://*.lmarena.ai/*
+// @match        https://arena.ai/*
+// @match        https://*.arena.ai/*
 // @match        https://chat.lmsys.org/*
 // @match        https://arena.lmsys.org/*
 // @match        https://copilot.microsoft.com/*
@@ -53,9 +56,9 @@
     target: "p2r_target",
     dry: "p2r_dry",
     run: "p2r_run",
-    lastHash: "p2r_last",
     gate: "p2r_gate",
-    agentMode: "p2r_agent_mode", // semi | auto | off
+    // clip(默认最安全: 仅复制剪贴板，绝不篡改输入框) | semi(仅当输入框为空时填入) | auto(空框自动填入并发送)
+    agentMode: "p2r_agent_mode",
   };
 
   const get = (k, d) => localStorage.getItem(k) ?? d;
@@ -63,7 +66,7 @@
   const autoOn = () => get(LS.auto, "1") === "1";
   const gateOn = () => get(LS.gate, "1") === "1";
   const dryOn = () => get(LS.dry, "0") === "1";
-  const agentMode = () => get(LS.agentMode, "semi");
+  const agentMode = () => get(LS.agentMode, "clip");
 
   const GATE = /P2R[-_\s]?READY/i;
   const FILE_MARK = /^[ \t]*(?:\*\*)?===\s*FILE:\s*[^\r\n]+?===/m;
@@ -121,7 +124,34 @@
   let autoSteps = 0;
   let agentStopped = false;
 
+  // 会话级去重与历史静默保护：避免打开旧对话/切会话时重放历史消息并污染新项目
+  const seenHashes = new Set();
+  let lastHref = location.href;
+  let quietUntil = Date.now() + 2500;
+
   const textOf = (el) => (el ? (el.innerText || el.textContent || "").trim() : "");
+
+  function hash(s) {
+    let h = 5381;
+    for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+    return String(h) + ":" + s.length;
+  }
+
+  function snapshotExistingMessages() {
+    for (const sel of SELECTORS) {
+      let nodes;
+      try { nodes = document.querySelectorAll(sel); } catch { continue; }
+      for (let i = 0; i < nodes.length; i++) {
+        const t = textOf(nodes[i]);
+        if (t && ANY_MARK.test(t)) seenHashes.add(hash(t));
+      }
+    }
+    const cur = findTarget();
+    if (cur) {
+      const t = textOf(cur);
+      if (t) seenHashes.add(hash(t));
+    }
+  }
 
   function findChatInput() {
     for (const sel of INPUT_SELECTORS) {
@@ -136,20 +166,28 @@
     return null;
   }
 
-  function fillChatInput(text, append = false) {
+  function readInputValue(el) {
+    if (!el) return "";
+    const isEditable = el.isContentEditable || el.getAttribute("contenteditable") === "true";
+    return (isEditable ? (el.innerText || el.textContent || "") : (el.value || "")).trim();
+  }
+
+  function fillChatInput(text, opts = {}) {
     const el = findChatInput();
-    if (!el) return false;
+    if (!el) return { ok: false, reason: "no-input" };
+    const cur = readInputValue(el);
+    // 铁律：非追加模式下，只要输入框已有用户内容，绝不覆盖！
+    if (!opts.append && !opts.forceOverwrite && cur.length > 0) {
+      return { ok: false, reason: "non-empty" };
+    }
     el.focus();
     const isEditable = el.isContentEditable || el.getAttribute("contenteditable") === "true";
+    const next = opts.append && cur ? (cur + "\n\n" + text) : text;
     if (isEditable) {
-      const cur = append ? (el.innerText || "").trim() : "";
-      const next = cur ? (cur + "\n\n" + text) : text;
       el.textContent = next;
       el.dispatchEvent(new InputEvent("input", { bubbles: true, data: text, inputType: "insertText" }));
       el.dispatchEvent(new Event("change", { bubbles: true }));
     } else {
-      const cur = append ? (el.value || "").trim() : "";
-      const next = cur ? (cur + "\n\n" + text) : text;
       const proto = el.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
       const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
       if (setter) setter.call(el, next);
@@ -157,7 +195,7 @@
       el.dispatchEvent(new Event("input", { bubbles: true }));
       el.dispatchEvent(new Event("change", { bubbles: true }));
     }
-    return true;
+    return { ok: true };
   }
 
   function triggerSend() {
@@ -182,13 +220,17 @@
   function deliverToChat(text, label) {
     clip(text);
     const mode = agentMode();
-    if (mode === "off") {
-      toast(label + "（已复制剪贴板）", 5000);
+    if (mode === "clip") {
+      toast(label + "（已复制剪贴板，未动输入框）", 5500);
       return;
     }
-    const filled = fillChatInput(text, false);
-    if (!filled) {
-      toast(label + "（未找到输入框，已复制剪贴板）", 5500);
+    const res = fillChatInput(text, { append: false, forceOverwrite: false });
+    if (!res.ok) {
+      if (res.reason === "non-empty") {
+        toast(label + "\n检测到输入框已有你的内容，已跳过自动填入（已复制剪贴板）", 6500);
+      } else {
+        toast(label + "（未找到输入框，已复制剪贴板）", 5500);
+      }
       return;
     }
     if (mode === "auto" && !agentStopped && autoSteps < MAX_AUTO_STEPS) {
@@ -198,7 +240,7 @@
         if (!agentStopped) triggerSend();
       }, 600);
     } else {
-      toast(label + "（已填入输入框，按回车发送）", 5500);
+      toast(label + "（已填入空白输入框，按回车发送）", 5500);
     }
   }
 
@@ -262,14 +304,14 @@
     return best;
   }
 
-  function toast(text, ms = 2800) {
+  function toast(text, ms = 3000) {
     let el = document.getElementById("p2r-toast");
     if (!el) {
       el = document.createElement("div");
       el.id = "p2r-toast";
       el.style.cssText = [
         "position:fixed", "right:18px", "bottom:18px", "z-index:2147483647",
-        "max-width:390px", "padding:10px 14px", "border-radius:0",
+        "max-width:400px", "padding:10px 14px", "border-radius:0",
         "background:#070707", "color:#f2f2f2",
         "font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace",
         "box-shadow:4px 4px 0 rgba(255,255,255,.15)", "white-space:pre-wrap",
@@ -313,12 +355,6 @@
         onerror: () => resolve(null),
       });
     });
-  }
-
-  function hash(s) {
-    let h = 5381;
-    for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
-    return String(h) + ":" + s.length;
   }
 
   function clip(text) {
@@ -366,7 +402,7 @@
       return;
     }
     const h = hash(text);
-    if (!opts.force && get(LS.lastHash) === h) return;
+    if (!opts.force && seenHashes.has(h)) return;
     if (!opts.force && gateOn() && !GATE.test(text)) {
       if (!opts.silent) {
         toast("[P2R] 未检测到 P2R-READY，点 [ APPLY ] 可强制执行", 4500);
@@ -384,13 +420,12 @@
     const serverAllowRun = !!info.allow_run;
     set(LS.run, serverAllowRun ? "1" : "0");
 
-    // 1. 若存在本地只读工具调用（===TOOL:===），先执行并把观察结果回填给网页 AI
     if (hasTool && !hasFile) {
       toast("[P2R AGENT] EXEC TOOLS…");
       try {
         const res = await post("/tool", { text }, 30000);
         if (res.ok && res.reply) {
-          set(LS.lastHash, h);
+          seenHashes.add(h);
           const names = (res.results || []).map((x) => x.tool).join(", ");
           deliverToChat(res.reply, `[P2R AGENT] 工具完成 (${names})`);
         } else {
@@ -404,7 +439,6 @@
       return;
     }
 
-    // 2. 落地文件（===FILE:===）
     toast("[P2R] APPLYING…");
     try {
       const res = await post("/apply", {
@@ -413,8 +447,8 @@
         source: location.hostname,
       });
       if (res.ok) {
-        set(LS.lastHash, h);
-        autoSteps = 0; // 成功落地一轮后重置自动步数
+        seenHashes.add(h);
+        autoSteps = 0;
         const list = (res.files || []).map((f) => "  + " + f.path).slice(0, 6).join("\n");
         const more = (res.files || []).length > 6 ? `\n  …共 ${res.files.length} 个文件` : "";
         const skipNote = (res.skipped || []).length ? `\n  ! 跳过 ${res.skipped.length} 个越界/受保护路径` : "";
@@ -446,7 +480,7 @@
             });
         }
       } else {
-        try { localStorage.removeItem(LS.lastHash); } catch {}
+        seenHashes.delete(h);
         lastFailAt = Date.now();
         if (res.error && res.error.indexOf("X-P2R-Token") >= 0) {
           toast("TOKEN 不匹配，请打开 " + ENDPOINT + " 重新安装脚本", 6000);
@@ -465,7 +499,21 @@
   let scanPending = false;
 
   function watch() {
+    snapshotExistingMessages();
     const mo = new MutationObserver(() => {
+      // SPA 路由切换检测：切换对话/新开对话时进入 2.5s 静默期并快照历史消息，防止重放旧对话
+      if (location.href !== lastHref) {
+        lastHref = location.href;
+        quietUntil = Date.now() + 2500;
+        lastText = "";
+        clearTimeout(timer);
+        setTimeout(snapshotExistingMessages, 1000);
+        return;
+      }
+      if (Date.now() < quietUntil) {
+        snapshotExistingMessages();
+        return;
+      }
       if (!autoOn() || scanPending) return;
       scanPending = true;
       setTimeout(() => {
@@ -474,11 +522,14 @@
         if (!node) return;
         const t = textOf(node);
         if (!t || t === lastText) return;
+        if (seenHashes.has(hash(t))) return;
         lastText = t;
         clearTimeout(timer);
         timer = setTimeout(() => {
           const now = textOf(node);
-          if (now === lastText && ANY_MARK.test(now)) handleNode(node, { silent: true });
+          if (now === lastText && ANY_MARK.test(now) && !seenHashes.has(hash(now))) {
+            handleNode(node, { silent: true });
+          }
         }, 1400);
       }, 300);
     });
@@ -490,12 +541,20 @@
     if (GM_openInTab) GM_openInTab(ENDPOINT + "/", { active: true });
     else window.open(ENDPOINT + "/", "_blank");
   });
-  GM_registerMenuCommand("向输入框注入 Agent 协议提示词", () => {
-    if (fillChatInput(AGENT_PROMPT, true)) toast("[P2R] 协议已注入输入框");
+  GM_registerMenuCommand("新建空白项目（隔离旧项目树）", async () => {
+    try {
+      const r = await post("/new-project", {});
+      if (r.ok) toast("[P2R] 已切到空白新项目:\n" + r.project, 4000);
+      else toast("[P2R] 新建失败: " + (r.error || ""));
+    } catch (e) { toast(e.message); }
+  });
+  GM_registerMenuCommand("向输入框追加 Agent 协议提示词", () => {
+    const res = fillChatInput(AGENT_PROMPT, { append: true });
+    if (res.ok) toast("[P2R] 协议已追加到输入框末尾");
     else { clip(AGENT_PROMPT); toast("[P2R] 未找到输入框，协议已复制"); }
   });
-  GM_registerMenuCommand("切换 Agent 回填模式（SEMI / AUTO / OFF）", () => {
-    const seq = ["semi", "auto", "off"];
+  GM_registerMenuCommand("切换 Agent 回填模式（CLIP / SEMI / AUTO）", () => {
+    const seq = ["clip", "semi", "auto"];
     const next = seq[(seq.indexOf(agentMode()) + 1) % seq.length];
     set(LS.agentMode, next);
     agentStopped = false;
@@ -538,15 +597,16 @@
     } catch (e) { toast(e.message); }
   });
 
-  // ── zip 自动接管（已解耦，不再错误绑定在 P2R-READY 文本门禁上） ──
+  // ── 深度 ZIP 自动接管（适配 LMArena / Bolt / v0 等离屏 a.click() 与即时 revoke） ──
   const pageWin = (typeof unsafeWindow !== "undefined" && unsafeWindow) ? unsafeWindow : window;
   const zipSeen = new Set();
+  const blobRegistry = new Map(); // blobUrl -> Blob
   const recentZipBlobs = [];
-
-  function looksZipType(t) { return /zip/i.test(t || ""); }
+  let origAnchorClick = null;
 
   async function isPkBlob(blob) {
     try {
+      if (!blob || typeof blob.slice !== "function" || blob.size < 22) return false;
       const head = new Uint8Array(await blob.slice(0, 4).arrayBuffer());
       return head.length >= 4 && head[0] === 0x50 && head[1] === 0x4b &&
         (head[2] === 0x03 || head[2] === 0x05 || head[2] === 0x07);
@@ -566,7 +626,7 @@
     });
   }
 
-  function replayBlob(a, href) {
+  function replayDownload(a, href) {
     try {
       const t = document.createElement("a");
       t.href = href;
@@ -575,17 +635,21 @@
       if (dl) t.download = dl;
       t.style.display = "none";
       document.body.appendChild(t);
-      t.click();
+      if (origAnchorClick) origAnchorClick.call(t);
+      else t.click();
       t.remove();
     } catch {}
   }
 
   async function importZipBlob(blob, why) {
-    if (!blob || !blob.size) return;
-    if (blob.size > 40 * 1024 * 1024) return toast("[P2R] zip 超过 40MB，跳过", 5000);
-    if (!(await isPkBlob(blob))) return;
+    if (!blob || !blob.size) return false;
+    if (blob.size > 40 * 1024 * 1024) {
+      toast("[P2R] zip 超过 40MB，交还浏览器下载", 5000);
+      return false;
+    }
+    if (!(await isPkBlob(blob))) return false;
     try {
-      toast("[P2R] 抓到 zip，正在解压…", 5000);
+      toast("[P2R] 截获 ZIP，正在解压落地…", 5000);
       const b64 = await blobToB64(blob);
       const r = await post("/import-zip", { zip: b64, source: why || "zip-blob" }, 180000);
       if (r.ok) {
@@ -594,34 +658,109 @@
         if (GM_notification) {
           GM_notification({ text: `Paste2Run 从 zip 导入 ${r.files.length} 个文件`, timeout: 3000 });
         }
+        return true;
       } else {
-        toast("[P2R] 导入失败: " + (r.error || ""), 7000);
+        toast("[P2R] ZIP 导入失败: " + (r.error || ""), 7000);
+        return false;
       }
     } catch (err) {
-      toast("[P2R] 导入失败: " + err.message, 7000);
+      toast("[P2R] ZIP 导入失败: " + err.message, 7000);
+      return false;
     }
   }
 
+  // 1) Hook URL.createObjectURL & 延迟 revokeObjectURL（防止 SPA 同步 revoke 导致读不到 blob）
   try {
     const U = pageWin.URL;
     const origCreate = U.createObjectURL;
+    const origRevoke = U.revokeObjectURL;
     if (origCreate && !origCreate.__p2rHook) {
-      const hooked = function (obj) {
+      const hookedCreate = function (obj) {
         const url = origCreate.call(U, obj);
         try {
-          const isBlob = obj && typeof obj.size === "number";
-          if (isBlob && (looksZipType(obj.type) || obj.size > 1024)) {
-            recentZipBlobs.push({ url, blob: obj, at: Date.now(), type: obj.type || "" });
-            while (recentZipBlobs.length > 6) recentZipBlobs.shift();
+          if (obj && typeof obj.size === "number" && obj.size >= 22) {
+            blobRegistry.set(url, obj);
+            recentZipBlobs.push({ url, blob: obj, at: Date.now() });
+            while (recentZipBlobs.length > 12) {
+              const old = recentZipBlobs.shift();
+              if (old) blobRegistry.delete(old.url);
+            }
           }
         } catch {}
         return url;
       };
-      hooked.__p2rHook = true;
-      U.createObjectURL = hooked;
+      hookedCreate.__p2rHook = true;
+      U.createObjectURL = hookedCreate;
+    }
+    if (origRevoke && !origRevoke.__p2rHook) {
+      const hookedRevoke = function (url) {
+        if (blobRegistry.has(url)) {
+          setTimeout(() => {
+            blobRegistry.delete(url);
+            try { origRevoke.call(U, url); } catch {}
+          }, 8000);
+          return;
+        }
+        return origRevoke.call(U, url);
+      };
+      hookedRevoke.__p2rHook = true;
+      U.revokeObjectURL = hookedRevoke;
     }
   } catch {}
 
+  // 2) Hook HTMLAnchorElement.prototype.click —— 拦截所有离屏创建的 <a download="xxx.zip">.click()（LMArena 等 SPA 核心路径）
+  try {
+    const AnchorProto = pageWin.HTMLAnchorElement && pageWin.HTMLAnchorElement.prototype;
+    if (AnchorProto && AnchorProto.click && !AnchorProto.click.__p2rHook) {
+      origAnchorClick = AnchorProto.click;
+      const hookedClick = function () {
+        try {
+          if (this.hasAttribute && this.hasAttribute("data-p2r-replay")) {
+            return origAnchorClick.call(this);
+          }
+          const href = String(this.href || "");
+          const dl = String((this.getAttribute && this.getAttribute("download")) || "");
+          if (/^blob:/i.test(href) && !zipSeen.has(href)) {
+            const cached = blobRegistry.get(href);
+            const self = this;
+            (async () => {
+              let blob = cached || null;
+              if (!blob) {
+                try { blob = await (await pageWin.fetch(href)).blob(); } catch {}
+              }
+              if (blob && (await isPkBlob(blob))) {
+                zipSeen.add(href);
+                const ok = await importZipBlob(blob, "zip-anchor-hook");
+                if (!ok) replayDownload(self, href);
+              } else {
+                replayDownload(self, href);
+              }
+            })();
+            return; // 暂缓原生下载，验完非 ZIP 再原样放行
+          }
+          if (/^https?:/i.test(href) && (/\.zip(\?|#|$)/i.test(href) || /\.zip$/i.test(dl))) {
+            toast("[P2R] 截获 ZIP 直链，下载并解压中…", 5000);
+            post("/fetch-zip", { url: href }, 180000)
+              .then((r) => {
+                if (r.ok) {
+                  const openNote = r.open && r.open.url ? `\n> 已打开 ${r.open.url}` : "";
+                  toast(`[P2R] 解压 ${r.files.length} 个文件 -> ${r.target}${openNote}`, 7000);
+                } else {
+                  replayDownload(this, href);
+                }
+              })
+              .catch(() => replayDownload(this, href));
+            return;
+          }
+        } catch {}
+        return origAnchorClick.call(this);
+      };
+      hookedClick.__p2rHook = true;
+      AnchorProto.click = hookedClick;
+    }
+  } catch {}
+
+  // 3) 页面内可见 <a> 点击与按钮兜底
   document.addEventListener("click", async (e) => {
     const a = e.target && e.target.closest ? e.target.closest("a[href]") : null;
     const href = a ? (a.href || "") : "";
@@ -632,19 +771,16 @@
       e.preventDefault();
       e.stopPropagation();
       if (zipSeen.has(href)) return;
-      let blob = null;
-      try {
-        const resp = await pageWin.fetch(href);
-        blob = await resp.blob();
-      } catch {
-        replayBlob(a, href);
-        return;
+      let blob = blobRegistry.get(href) || null;
+      if (!blob) {
+        try { blob = await (await pageWin.fetch(href)).blob(); } catch {}
       }
-      if (await isPkBlob(blob)) {
+      if (blob && (await isPkBlob(blob))) {
         zipSeen.add(href);
-        await importZipBlob(blob, "zip-blob-url");
+        const ok = await importZipBlob(blob, "zip-blob-url");
+        if (!ok) replayDownload(a, href);
       } else {
-        replayBlob(a, href);
+        replayDownload(a, href);
       }
       return;
     }
@@ -667,25 +803,25 @@
     }
 
     if (!a) {
-      const t = e.target || {};
-      const label = String((t.textContent || "") + " " +
-        (t.getAttribute ? (t.getAttribute("aria-label") || "") + " " + (t.title || "") : "")).slice(0, 60);
-      if (!/zip|下载|download|导出|打包/i.test(label)) return;
+      const t = e.target && e.target.closest ? (e.target.closest("button,[role='button']") || e.target) : e.target;
+      const label = String(((t && t.textContent) || "") + " " +
+        (t && t.getAttribute ? (t.getAttribute("aria-label") || "") + " " + (t.title || "") : "")).slice(0, 80);
+      if (!/zip|下载|download|导出|export|打包/i.test(label)) return;
       setTimeout(() => {
         const now = Date.now();
-        const fresh = recentZipBlobs.filter((b) => now - b.at < 1500 && !zipSeen.has(b.url));
+        const fresh = recentZipBlobs.filter((b) => now - b.at < 2000 && !zipSeen.has(b.url));
         if (!fresh.length) return;
         const last = fresh[fresh.length - 1];
         zipSeen.add(last.url);
         importZipBlob(last.blob, "zip-button");
-      }, 350);
+      }, 400);
     }
   }, true);
 
-  // ── 左下角黑白极简 ASCII 悬浮微条（零摩擦操作，无需切回控制台） ──
+  // ── 左下角黑白极简 ASCII 悬浮微条 ────────────────────────────
   let btnAgent = null;
   function refreshBar() {
-    if (btnAgent) btnAgent.textContent = "AGENT:" + agentMode().toUpperCase();
+    if (btnAgent) btnAgent.textContent = "FILL:" + agentMode().toUpperCase();
   }
 
   function makeBtn(label, title, onClick) {
@@ -716,10 +852,19 @@
     bar.onmouseenter = () => (bar.style.opacity = "1");
     bar.onmouseleave = () => (bar.style.opacity = ".72");
 
-    bar.appendChild(makeBtn("+P2R", "一键往当前输入框注入 Agent 协议提示词", () => {
+    bar.appendChild(makeBtn("+NEW", "切到空白新项目目录（彻底隔离旧项目树）", async () => {
+      try {
+        const r = await post("/new-project", {});
+        if (r.ok) toast("[P2R] 新空白项目就绪:\n" + r.project, 4000);
+        else toast("[P2R] 新建失败: " + (r.error || ""));
+      } catch (e) { toast(e.message); }
+    }));
+
+    bar.appendChild(makeBtn("+P2R", "往当前输入框末尾追加 Agent 协议（不会覆盖你写的文字）", () => {
       agentStopped = false;
       autoSteps = 0;
-      if (fillChatInput(AGENT_PROMPT, true)) toast("[P2R] Agent 协议已注入输入框");
+      const res = fillChatInput(AGENT_PROMPT, { append: true });
+      if (res.ok) toast("[P2R] 协议已追加到输入框末尾");
       else { clip(AGENT_PROMPT); toast("[P2R] 未找到输入框，协议已复制"); }
     }));
 
@@ -737,14 +882,14 @@
       } catch (e) { toast(e.message); }
     }));
 
-    btnAgent = makeBtn("AGENT:" + agentMode().toUpperCase(), "切换轻量 Agent 回填模式（SEMI=填输入框 / AUTO=自动接力 / OFF=仅复制）", () => {
-      const seq = ["semi", "auto", "off"];
+    btnAgent = makeBtn("FILL:" + agentMode().toUpperCase(), "切换结果回填方式（CLIP=仅复制不碰输入框 / SEMI=仅空框自动填 / AUTO=空框自动发）", () => {
+      const seq = ["clip", "semi", "auto"];
       const next = seq[(seq.indexOf(agentMode()) + 1) % seq.length];
       set(LS.agentMode, next);
       agentStopped = false;
       autoSteps = 0;
       refreshBar();
-      toast("AGENT MODE: " + next.toUpperCase());
+      toast("FILL MODE: " + next.toUpperCase());
     });
     bar.appendChild(btnAgent);
 

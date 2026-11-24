@@ -40,7 +40,7 @@ from functools import partial
 import http.server as _http_server
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.5.0"
+VERSION = "0.5.1"
 HOME = os.path.expanduser("~/.p2r")
 CONFIG = os.path.join(HOME, "config.json")
 LOG = os.path.join(HOME, "p2r.log")
@@ -270,6 +270,35 @@ def safe_target(root, rel):
 
 
 PROJECT_CONFIDENCE = 0.6
+
+
+
+
+def reset_active_project(base, name=""):
+    """切换到全新空白项目上下文，清除旧项目的 last-target 指针，避免旧项目树污染新项目。"""
+    base = os.path.abspath(os.path.expanduser(base))
+    os.makedirs(base, exist_ok=True)
+    lt_file = os.path.join(base, ".p2r", "last-target")
+    if name:
+        safe = re.sub(r"[^0-9A-Za-z._-]+", "-", name.strip()).strip("-.")[:60]
+        if not safe:
+            return {"ok": False, "error": "项目名不合法"}
+        new_root = os.path.join(base, safe)
+        os.makedirs(new_root, exist_ok=True)
+        os.makedirs(os.path.join(base, ".p2r"), exist_ok=True)
+        with open(lt_file, "w", encoding="utf-8") as fh:
+            fh.write(new_root)
+        log("new-project root=%s" % new_root)
+        return {"ok": True, "target": new_root, "base": base, "project": safe}
+    # 不指定名字时，建一个干净的空新项目目录，彻底隔离旧项目树与旧 last-apply.json
+    safe = "proj-" + time.strftime("%Y%m%d-%H%M%S")
+    new_root = os.path.join(base, safe)
+    os.makedirs(new_root, exist_ok=True)
+    os.makedirs(os.path.join(base, ".p2r"), exist_ok=True)
+    with open(lt_file, "w", encoding="utf-8") as fh:
+        fh.write(new_root)
+    log("new-project root=%s" % new_root)
+    return {"ok": True, "target": new_root, "base": base, "project": safe}
 
 
 def resolve_root(base):
@@ -1933,6 +1962,7 @@ pre.tree-box { white-space: pre; word-break: normal; max-height: 220px; }
           <div class="panel-title"><span class="idx">05 //</span>PROJECT TREE</div>
           <div class="row" style="gap:6px">
             <span id="tree-count" style="font-size:11px;color:var(--fg-dim)">—</span>
+            <button class="sm" id="btn-new-project">[ + NEW PROJECT ]</button>
             <button class="sm" id="btn-refresh-tree">[ ↻ ]</button>
           </div>
         </div>
@@ -2279,6 +2309,16 @@ echo "Paste2Run OK"`;
   $("#toggle-run").addEventListener("keydown", (e) => { if (e.key === " " || e.key === "Enter") { e.preventDefault(); onToggleRun(); } });
   $("#btn-refresh").addEventListener("click", () => { loadState(); toast("SYNCED"); });
   $("#btn-refresh-tree").addEventListener("click", () => { loadTree(); toast("TREE REFRESHED"); });
+  $("#btn-new-project").addEventListener("click", async () => {
+    try {
+      const r = await fetch("/new-project", { method: "POST", headers: H(), body: "{}" });
+      const j = await r.json();
+      if (j.ok) {
+        toast("已切到空白新项目: " + j.project);
+        loadState();
+      } else toast("新建失败: " + (j.error || ""));
+    } catch (e) { toast("请求失败"); }
+  });
   $("#btn-copy-endpoint").addEventListener("click", () => copyText(location.origin, "ENDPOINT COPIED"));
   $("#btn-load-sample").addEventListener("click", () => { $("#paste-input").value = SAMPLE_REPLY; toast("SAMPLE LOADED"); });
   $("#btn-dry-run").addEventListener("click", () => submitApply(true));
@@ -2722,6 +2762,10 @@ class Handler(BaseHTTPRequestHandler):
                     res["open"] = open_static(zroot, entry, inproc=True)
             return self._json(200 if res.get("ok") else 422, res)
 
+        if path == "/new-project":
+            res = reset_active_project(root, body.get("name") or "")
+            return self._json(200 if res.get("ok") else 400, res)
+
         if path == "/export":
             md = export_workflow(proj_root)
             name = "workflow-%s.md" % time.strftime("%Y%m%d-%H%M%S")
@@ -2931,8 +2975,8 @@ MIRROR_PREFIXES = (
     "https://ghproxy.net/",
 )
 # update 只碰这些文件，配置 .p2r/ 和用户自己的项目目录一律不碰
-UPDATE_FILES = ("p2r.py", "p2r.user.js", "README.md",
-                "start.sh", "start.bat", "start.command", "LICENSE")
+UPDATE_FILES = ("p2r.py", "p2r.user.js", "README.md", "HANDOFF.md",
+                "start.sh", "start.bat", "start.command", "start_silent.vbs", "LICENSE")
 
 
 def _download(urls, timeout=25):
@@ -3246,13 +3290,13 @@ npm install && npm run dev
 
         # 项目隔离：文件重合度高算同一项目，全不同就新开目录
         with tempfile.TemporaryDirectory() as pbase:
-            r1 = apply_text("===FILE: index.html===\nA\n===FILE: app.js===\nB\n", pbase)
+            r1 = apply_text("===FILE: index.html===\nA\n===FILE: app.js===\nB\n", pbase, project_mode="auto")
             assert os.path.abspath(r1["target"]) == os.path.abspath(pbase), r1["target"]
-            r2 = apply_text("===FILE: index.html===\nA2\n===FILE: app.js===\nB2\n", pbase)
+            r2 = apply_text("===FILE: index.html===\nA2\n===FILE: app.js===\nB2\n", pbase, project_mode="auto")
             assert os.path.abspath(r2["target"]) == os.path.abspath(pbase), r2["target"]
-            r3 = apply_text("===FILE: other.html===\nX\n===FILE: main.py===\nY\n", pbase)
+            r3 = apply_text("===FILE: other.html===\nX\n===FILE: main.py===\nY\n", pbase, project_mode="auto")
             assert os.path.abspath(r3["target"]) != os.path.abspath(pbase), r3["target"]
-            r4 = apply_text("===PROJECT: tagged===\n===FILE: z.txt===\n1\n", pbase)
+            r4 = apply_text("===PROJECT: tagged===\n===FILE: z.txt===\n1\n", pbase, project_mode="auto")
             assert os.path.basename(r4["target"]) == "tagged", r4["target"]
 
         # update 的版本解析
@@ -3273,7 +3317,15 @@ npm install && npm run dev
         tr = execute_tools(tmp4, ts)
         assert tr["ok"] and len(tr["results"]) == 3 and "hi agent" in tr["reply"], tr
 
-    print("selftest ok: 解析 / P2R-READY剥离 / 轻量Agent工具 / 围栏与尾随结语 / 乱序RUN / 越界与.git拦截 / IPv6 Host /"
+    # v0.5.1: 切换空白新项目不再残留旧项目树
+    with tempfile.TemporaryDirectory() as tmp5:
+        apply_text("===PROJECT: oldapp===\n===FILE: old.js===\n1\n", tmp5, project_mode="auto")
+        assert "old.js" in project_tree(resolve_root(tmp5))
+        nr = reset_active_project(tmp5, "fresh-app")
+        assert nr["ok"] and resolve_root(tmp5) == nr["target"]
+        assert project_tree(resolve_root(tmp5)) == ""
+
+    print("selftest ok: 解析 / P2R-READY剥离 / 轻量Agent工具 / 新项目隔离重置 / 围栏与尾随结语 / 乱序RUN / 越界与.git拦截 / IPv6 Host /"
           " 覆写备份(last不膨胀) / 报错归因 / 项目探测 / 项目隔离 全部通过")
 
 
