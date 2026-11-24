@@ -40,7 +40,7 @@ from functools import partial
 import http.server as _http_server
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.5.1"
+VERSION = "0.4.8"
 HOME = os.path.expanduser("~/.p2r")
 CONFIG = os.path.join(HOME, "config.json")
 LOG = os.path.join(HOME, "p2r.log")
@@ -52,9 +52,7 @@ PORT_TRIES = 10
 FILE_RE = re.compile(r"^[ \t]*(?:\*\*)?===\s*FILE:\s*(.+?)\s*===\s*(?:\*\*)?[ \t]*$", re.M)
 RUN_RE = re.compile(r"^[ \t]*(?:\*\*)?===\s*RUN\s*===\s*(?:\*\*)?[ \t]*$", re.M)
 PROJECT_RE = re.compile(r"^[ \t]*(?:\*\*)?===\s*PROJECT:\s*(.+?)\s*===\s*(?:\*\*)?[ \t]*$", re.M)
-TOOL_RE = re.compile(r"^[ \t]*(?:\*\*)?===\s*TOOL:\s*([A-Za-z0-9_.-]+)\s*===\s*(?:\*\*)?[ \t]*$", re.M)
 GATE_RE = re.compile(r"P2R[-_\s]?READY", re.I)
-GATE_LINE_RE = re.compile(r"^[ \t]*(?:\*\*)?P2R[-_\s]?READY(?:\*\*)?[ \t]*$", re.I | re.M)
 
 _CONFIG_LOCK = threading.Lock()
 
@@ -149,22 +147,10 @@ def strip_fences(body):
     return "\n".join(lines) + "\n"
 
 
-def _strip_gate_lines(text):
-    """去掉独立成行的 P2R-READY 门禁标记，避免污染最后一个文件或被当成 shell 命令执行。"""
-    lines = (text or "").splitlines()
-    while lines and not lines[-1].strip():
-        lines.pop()
-    while lines and GATE_LINE_RE.match(lines[-1]):
-        lines.pop()
-        while lines and not lines[-1].strip():
-            lines.pop()
-    return "\n".join(lines)
+def parse(text):
+    """返回 (files: [(path, content)], run_commands: str)
 
-
-def parse_all(text):
-    """统一解析文本中的 ===FILE:=== / ===RUN=== / ===TOOL:=== / ===PROJECT:=== / P2R-READY。
-
-    返回 (files: [(path, content)], run_commands: str, tools: [(name, raw_arg)])。
+    ===PROJECT: 名字=== 也当分隔符处理，否则它会混进前一个文件的内容里。
     """
     text = (text or "").replace("\ufeff", "").replace("\r\n", "\n")
     markers = []
@@ -174,43 +160,22 @@ def parse_all(text):
         markers.append(("run", mt.start(), mt.end(), ""))
     for mt in PROJECT_RE.finditer(text):
         markers.append(("project", mt.start(), mt.end(), mt.group(1).strip()))
-    for mt in TOOL_RE.finditer(text):
-        markers.append(("tool", mt.start(), mt.end(), mt.group(1).strip().lower()))
-    for mt in GATE_LINE_RE.finditer(text):
-        markers.append(("gate", mt.start(), mt.end(), ""))
     if not markers:
-        return [], "", []
+        return [], ""
 
     markers.sort(key=lambda item: item[1])
     files = []
     run_parts = []
-    tools = []
     for i, (kind, _start, end_pos, label) in enumerate(markers):
         next_start = markers[i + 1][1] if i + 1 < len(markers) else len(text)
         chunk = text[end_pos:next_start]
         if kind == "file":
-            cleaned = strip_fences(_strip_gate_lines(chunk))
-            files.append((label, cleaned))
+            files.append((label, strip_fences(chunk)))
         elif kind == "run":
-            cmd = strip_fences(_strip_gate_lines(chunk)).strip()
+            cmd = strip_fences(chunk).strip()
             if cmd:
                 run_parts.append(cmd)
-        elif kind == "tool":
-            arg = strip_fences(_strip_gate_lines(chunk)).strip()
-            tools.append((label, arg))
-    return files, "\n".join(run_parts).strip(), tools
-
-
-def parse(text):
-    """返回 (files: [(path, content)], run_commands: str)"""
-    files, run_cmds, _tools = parse_all(text)
-    return files, run_cmds
-
-
-def parse_tools(text):
-    """返回 [(tool_name, raw_arg)]"""
-    _files, _run, tools = parse_all(text)
-    return tools
+    return files, "\n".join(run_parts).strip()
 
 
 def parse_project(text):
@@ -230,19 +195,6 @@ PROMPT_STD = """输出格式严格要求：
 如果是新项目，第一行先给 ===PROJECT: 英文小写项目名===；同一项目后续修改沿用同名，不要换。
 启动命令不是必填项：只有你确定某条命令能跑起来时，才在最后用 ===RUN=== 给一条；不确定就省略。
 全部给完后，最后单独一行输出 P2R-READY；只是讨论、片段或没写完时不要输出这个标记。"""
-
-PROMPT_AGENT = """Paste2Run 轻量 Agent 协议（零 Token 本地工具）：
-1. 需要查看本地项目上下文时，可输出一个或多个工具调用块（然后等待下一轮工具结果）：
-   ===TOOL: tree===
-   ===TOOL: list_files===
-   ===TOOL: read_file===
-   src/app.js
-   ===TOOL: search===
-   关键字
-   ===TOOL: status===
-2. 准备好修改或生成代码时，用 ===FILE: 相对路径=== 输出完整文件内容（不要省略号、不要 diff）。
-3. 新项目首行加 ===PROJECT: 英文小写项目名===；确定可运行的启动命令才附 ===RUN===。
-4. 本轮工具调用或代码全部输出完后，最后单独一行输出 P2R-READY。"""
 
 PROTECTED_TOP_DIRS = {".git", ".p2r"}
 
@@ -270,35 +222,6 @@ def safe_target(root, rel):
 
 
 PROJECT_CONFIDENCE = 0.6
-
-
-
-
-def reset_active_project(base, name=""):
-    """切换到全新空白项目上下文，清除旧项目的 last-target 指针，避免旧项目树污染新项目。"""
-    base = os.path.abspath(os.path.expanduser(base))
-    os.makedirs(base, exist_ok=True)
-    lt_file = os.path.join(base, ".p2r", "last-target")
-    if name:
-        safe = re.sub(r"[^0-9A-Za-z._-]+", "-", name.strip()).strip("-.")[:60]
-        if not safe:
-            return {"ok": False, "error": "项目名不合法"}
-        new_root = os.path.join(base, safe)
-        os.makedirs(new_root, exist_ok=True)
-        os.makedirs(os.path.join(base, ".p2r"), exist_ok=True)
-        with open(lt_file, "w", encoding="utf-8") as fh:
-            fh.write(new_root)
-        log("new-project root=%s" % new_root)
-        return {"ok": True, "target": new_root, "base": base, "project": safe}
-    # 不指定名字时，建一个干净的空新项目目录，彻底隔离旧项目树与旧 last-apply.json
-    safe = "proj-" + time.strftime("%Y%m%d-%H%M%S")
-    new_root = os.path.join(base, safe)
-    os.makedirs(new_root, exist_ok=True)
-    os.makedirs(os.path.join(base, ".p2r"), exist_ok=True)
-    with open(lt_file, "w", encoding="utf-8") as fh:
-        fh.write(new_root)
-    log("new-project root=%s" % new_root)
-    return {"ok": True, "target": new_root, "base": base, "project": safe}
 
 
 def resolve_root(base):
@@ -488,17 +411,11 @@ def import_zip(data, target, source="zip", project=None, project_mode=None):
     os.makedirs(os.path.join(root, ".p2r"), exist_ok=True)
     with open(os.path.join(root, ".p2r", "last-apply.json"), "w", encoding="utf-8") as fh:
         json.dump(manifest, fh, ensure_ascii=False, indent=2)
-    lt_file = os.path.join(base, ".p2r", "last-target")
     if root != base:
         try:
             os.makedirs(os.path.join(base, ".p2r"), exist_ok=True)
-            with open(lt_file, "w", encoding="utf-8") as fh:
+            with open(os.path.join(base, ".p2r", "last-target"), "w", encoding="utf-8") as fh:
                 fh.write(root)
-        except OSError:
-            pass
-    elif os.path.isfile(lt_file):
-        try:
-            os.remove(lt_file)
         except OSError:
             pass
     log("import-zip source=%s root=%s files=%d skipped=%d" % (source, root, len(written), len(skipped)))
@@ -683,165 +600,16 @@ def apply_text(text, target, dry_run=False, backup=True, source="manual",
         with open(os.path.join(root, ".p2r", "last-apply.json"), "w", encoding="utf-8") as fh:
             json.dump(manifest, fh, ensure_ascii=False, indent=2)
         # 在根目录记一笔真实项目目录，后面 /run /open /export 才知道去哪找
-        lt_file = os.path.join(base, ".p2r", "last-target")
         if root != base:
             try:
                 os.makedirs(os.path.join(base, ".p2r"), exist_ok=True)
-                with open(lt_file, "w", encoding="utf-8") as fh:
+                with open(os.path.join(base, ".p2r", "last-target"), "w", encoding="utf-8") as fh:
                     fh.write(root)
-            except OSError:
-                pass
-        elif os.path.isfile(lt_file):
-            try:
-                os.remove(lt_file)
             except OSError:
                 pass
     log("apply source=%s target=%s files=%d skipped=%d dry=%s backup=%s"
         % (source, root, len(written), len(skipped), dry_run, backup_mode))
     return {"ok": True, **manifest}
-
-
-
-
-# ----------------------------------------------------------------
-# 轻量 Agent 本地工具（只读安全白名单，零外部依赖）
-# ----------------------------------------------------------------
-MAX_TOOL_FILE_BYTES = 12000
-MAX_SEARCH_HITS = 40
-
-
-def _tool_read_file(root, arg):
-    """读取项目内指定相对路径文件，支持 `path` 或 `path:start-end` 行范围。"""
-    spec = (arg or "").strip()
-    if spec.startswith("{"):
-        try:
-            obj = json.loads(spec)
-            spec = str(obj.get("path") or "")
-            if obj.get("start") and obj.get("end"):
-                spec = "%s:%s-%s" % (spec, obj["start"], obj["end"])
-        except Exception:
-            pass
-    if not spec:
-        return {"ok": False, "error": "缺少文件路径"}
-    rel = spec
-    line_range = None
-    m = re.match(r"^(.+?):(\d+)-(\d+)$", spec)
-    if m:
-        rel = m.group(1).strip()
-        line_range = (max(1, int(m.group(2))), max(1, int(m.group(3))))
-    try:
-        full = safe_target(root, rel)
-    except ValueError as exc:
-        return {"ok": False, "error": str(exc)}
-    if not os.path.isfile(full):
-        return {"ok": False, "error": "文件不存在: %s" % rel}
-    try:
-        with open(full, "rb") as fh:
-            raw = fh.read(MAX_TOOL_FILE_BYTES + 1)
-    except OSError as exc:
-        return {"ok": False, "error": "读取失败: %s" % exc}
-    truncated = len(raw) > MAX_TOOL_FILE_BYTES
-    text = raw[:MAX_TOOL_FILE_BYTES].decode("utf-8", "replace")
-    if line_range:
-        lines = text.splitlines()
-        s, e = line_range
-        picked = lines[s - 1:e]
-        text = "\n".join("%d: %s" % (s + idx, ln) for idx, ln in enumerate(picked))
-    return {"ok": True, "path": rel, "content": text, "truncated": truncated}
-
-
-def _tool_list_files(root, arg):
-    items = []
-    for dirpath, dirs, files in os.walk(root):
-        dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS and not d.startswith("."))
-        for fn in sorted(files):
-            if fn.startswith(".DS_Store"):
-                continue
-            full = os.path.join(dirpath, fn)
-            rel = os.path.relpath(full, root).replace(os.sep, "/")
-            try:
-                sz = os.path.getsize(full)
-            except OSError:
-                sz = 0
-            items.append("%s (%d B)" % (rel, sz))
-            if len(items) >= 120:
-                items.append("… (已截断)")
-                return {"ok": True, "content": "\n".join(items)}
-    return {"ok": True, "content": "\n".join(items) or "(空目录)"}
-
-
-def _tool_search(root, arg):
-    q = (arg or "").strip()
-    if q.startswith("{"):
-        try:
-            q = str((json.loads(q) or {}).get("query") or "")
-        except Exception:
-            pass
-    if not q:
-        return {"ok": False, "error": "缺少搜索关键字"}
-    hits = []
-    q_low = q.lower()
-    for dirpath, dirs, files in os.walk(root):
-        dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS and not d.startswith("."))
-        for fn in sorted(files):
-            full = os.path.join(dirpath, fn)
-            try:
-                if os.path.getsize(full) > 512 * 1024:
-                    continue
-                with open(full, "rb") as fh:
-                    chunk = fh.read(256 * 1024)
-                if b"\x00" in chunk[:2048]:
-                    continue
-                lines = chunk.decode("utf-8", "replace").splitlines()
-            except OSError:
-                continue
-            rel = os.path.relpath(full, root).replace(os.sep, "/")
-            for idx, ln in enumerate(lines, 1):
-                if q_low in ln.lower():
-                    hits.append("%s:%d: %s" % (rel, idx, ln.strip()[:160]))
-                    if len(hits) >= MAX_SEARCH_HITS:
-                        hits.append("… (命中超过 %d 条，已截断)" % MAX_SEARCH_HITS)
-                        return {"ok": True, "content": "\n".join(hits)}
-    return {"ok": True, "content": "\n".join(hits) or "(未找到匹配项)"}
-
-
-def execute_tools(root, tools):
-    """执行白名单只读工具并拼装可直接发回给网页 AI 的观察结果文本。"""
-    results = []
-    blocks = []
-    for name, arg in (tools or [])[:8]:
-        tname = (name or "").strip().lower()
-        if tname == "read_file":
-            r = _tool_read_file(root, arg)
-        elif tname == "tree":
-            r = {"ok": True, "content": project_tree(root, max_entries=120, max_depth=3) or "(空目录)"}
-        elif tname == "list_files":
-            r = _tool_list_files(root, arg)
-        elif tname == "search":
-            r = _tool_search(root, arg)
-        elif tname == "status":
-            plan = minimal_run_plan(root)
-            dev = dev_server_status(root)
-            r = {"ok": True, "content": "kind=%s\ndir=%s\ndev_alive=%s url=%s\nplan:\n%s" % (
-                plan.get("kind"), root, dev.get("alive"), dev.get("url") or "-", plan.get("text") or ""
-            )}
-        else:
-            r = {"ok": False, "error": "不支持的工具: %s（可用: read_file / tree / list_files / search / status）" % tname}
-        results.append({"tool": tname, "arg": arg, **r})
-        header = "===TOOL_RESULT: %s%s===" % (tname, (" " + arg.splitlines()[0][:60]) if arg else "")
-        body = r.get("content") if r.get("ok") else ("[ERROR] " + str(r.get("error") or "failed"))
-        if r.get("truncated"):
-            body += "\n[...文件超过 12KB 已截断，可用 path:起始行-结束行 分段读取]"
-        blocks.append(header + "\n" + (body or ""))
-
-    reply_text = (
-        "以下是本地工具返回结果，请基于这些真实上下文继续。\n\n"
-        + "\n\n".join(blocks)
-        + "\n\n如果还需要查其它文件，可继续输出 ===TOOL: ...===；"
-          "如果信息已足够，请直接用 ===FILE: 相对路径=== 输出完整修改后的文件，最后单独一行输出 P2R-READY。"
-    )
-    log("tool root=%s count=%d" % (root, len(results)))
-    return {"ok": True, "target": root, "results": results, "reply": reply_text}
 
 
 SKIP_DIRS = {".git", "node_modules", ".p2r", "__pycache__", ".venv", "venv", "dist", "build"}
@@ -1415,23 +1183,14 @@ _STATIC_LOCK = threading.Lock()
 _STATIC_SERVERS = {}
 
 
-class _NoCacheStaticHandler(_http_server.SimpleHTTPRequestHandler):
-    def end_headers(self):
-        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
-        super().end_headers()
-
-    def log_message(self, fmt, *args):
-        pass
-
-
 def _static_inproc(directory):
-    """进程内起一个只读静态服务，端口由系统分配，禁用浏览器缓存，服务活着就一直可用。"""
+    """进程内起一个只读静态服务，端口由系统分配，服务活着就一直可用。"""
     key = os.path.abspath(directory)
     with _STATIC_LOCK:
         srv = _STATIC_SERVERS.get(key)
         if srv is not None:
             return srv
-        handler = partial(_NoCacheStaticHandler, directory=key)
+        handler = partial(_http_server.SimpleHTTPRequestHandler, directory=key)
         srv = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         srv.daemon_threads = True
         threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -1943,7 +1702,6 @@ pre.tree-box { white-space: pre; word-break: normal; max-height: 220px; }
             <button class="tab active" data-preset="std">STD</button>
             <button class="tab" data-preset="strict">STRICT</button>
             <button class="tab" data-preset="patch">PATCH</button>
-            <button class="tab" data-preset="agent">AGENT</button>
           </div>
         </div>
         <div class="panel-body">
@@ -1962,7 +1720,6 @@ pre.tree-box { white-space: pre; word-break: normal; max-height: 220px; }
           <div class="panel-title"><span class="idx">05 //</span>PROJECT TREE</div>
           <div class="row" style="gap:6px">
             <span id="tree-count" style="font-size:11px;color:var(--fg-dim)">—</span>
-            <button class="sm" id="btn-new-project">[ + NEW PROJECT ]</button>
             <button class="sm" id="btn-refresh-tree">[ ↻ ]</button>
           </div>
         </div>
@@ -2074,20 +1831,7 @@ pre.tree-box { white-space: pre; word-break: normal; max-height: 220px; }
 每个文件以 ===FILE: 相对路径=== 开头并给出完整文件内容（不要 diff 片段，不要省略号）。
 沿用该项目的 ===PROJECT: 名称===，不确定就不用写。
 只有确定构建或启动命令时才附加 ===RUN=== 段。
-改完后最后单独一行输出 P2R-READY。`,
-    agent:
-`Paste2Run 轻量 Agent 协议（零 Token 本地工具）：
-1. 需要查看本地项目上下文时，可输出一个或多个工具调用块（然后等待下一轮工具结果）：
-   ===TOOL: tree===
-   ===TOOL: list_files===
-   ===TOOL: read_file===
-   src/app.js
-   ===TOOL: search===
-   关键字
-   ===TOOL: status===
-2. 准备好修改或生成代码时，用 ===FILE: 相对路径=== 输出完整文件内容（不要省略号、不要 diff）。
-3. 新项目首行加 ===PROJECT: 英文小写项目名===；确定可运行的启动命令才附 ===RUN===。
-4. 本轮工具调用或代码全部输出完后，最后单独一行输出 P2R-READY。`
+改完后最后单独一行输出 P2R-READY。`
   };
   const SAMPLE_REPLY = `===FILE: index.html===
 \`\`\`html
@@ -2309,16 +2053,6 @@ echo "Paste2Run OK"`;
   $("#toggle-run").addEventListener("keydown", (e) => { if (e.key === " " || e.key === "Enter") { e.preventDefault(); onToggleRun(); } });
   $("#btn-refresh").addEventListener("click", () => { loadState(); toast("SYNCED"); });
   $("#btn-refresh-tree").addEventListener("click", () => { loadTree(); toast("TREE REFRESHED"); });
-  $("#btn-new-project").addEventListener("click", async () => {
-    try {
-      const r = await fetch("/new-project", { method: "POST", headers: H(), body: "{}" });
-      const j = await r.json();
-      if (j.ok) {
-        toast("已切到空白新项目: " + j.project);
-        loadState();
-      } else toast("新建失败: " + (j.error || ""));
-    } catch (e) { toast("请求失败"); }
-  });
   $("#btn-copy-endpoint").addEventListener("click", () => copyText(location.origin, "ENDPOINT COPIED"));
   $("#btn-load-sample").addEventListener("click", () => { $("#paste-input").value = SAMPLE_REPLY; toast("SAMPLE LOADED"); });
   $("#btn-dry-run").addEventListener("click", () => submitApply(true));
@@ -2715,21 +2449,6 @@ class Handler(BaseHTTPRequestHandler):
         # auto 模式下项目可能在子目录，接口统一用真实项目目录
         proj_root = resolve_root(root)
 
-        if path == "/tool":
-            tools = body.get("tools")
-            if not tools and body.get("text"):
-                tools = parse_tools(body.get("text"))
-            if not tools:
-                return self._json(400, {"ok": False, "error": "没有可执行的 ===TOOL: ...=== 调用"})
-            norm = []
-            for item in tools:
-                if isinstance(item, dict):
-                    norm.append((item.get("tool") or item.get("name") or "", item.get("arg") or ""))
-                elif isinstance(item, (list, tuple)) and len(item) >= 2:
-                    norm.append((item[0], item[1]))
-            res = execute_tools(proj_root, norm)
-            return self._json(200, res)
-
         if path == "/import-zip":
             b64 = body.get("zip") or ""
             try:
@@ -2741,30 +2460,12 @@ class Handler(BaseHTTPRequestHandler):
                              project=body.get("project"),
                              project_mode=body.get("project_mode"))
             res["base"] = root
-            if res.get("ok") and cfg.get("auto_open") in ("static", "always"):
-                zroot = res.get("target") or root
-                plan = minimal_run_plan(zroot)
-                res["plan"] = plan
-                entry = plan.get("entry")
-                if entry and (cfg.get("auto_open") == "always" or plan.get("kind") == "static") and _should_open(entry):
-                    res["open"] = open_static(zroot, entry, inproc=True)
             return self._json(200 if res.get("ok") else 422, res)
 
         if path == "/fetch-zip":
             res = fetch_zip(body.get("url") or "", target)
             res["base"] = root
-            if res.get("ok") and cfg.get("auto_open") in ("static", "always"):
-                zroot = res.get("target") or root
-                plan = minimal_run_plan(zroot)
-                res["plan"] = plan
-                entry = plan.get("entry")
-                if entry and (cfg.get("auto_open") == "always" or plan.get("kind") == "static") and _should_open(entry):
-                    res["open"] = open_static(zroot, entry, inproc=True)
             return self._json(200 if res.get("ok") else 422, res)
-
-        if path == "/new-project":
-            res = reset_active_project(root, body.get("name") or "")
-            return self._json(200 if res.get("ok") else 400, res)
 
         if path == "/export":
             md = export_workflow(proj_root)
@@ -2791,7 +2492,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/repair":
                 output = body.get("output") or ""
                 verdict = classify_error(output, body.get("code"))
-                plan = minimal_run_plan(proj_root)
+                plan = minimal_run_plan(root)
                 force = bool(body.get("force"))
                 if verdict["class"] == "env" and not force:
                     # 环境问题不让 AI 改代码，直接给用户最简方案
@@ -2804,7 +2505,7 @@ class Handler(BaseHTTPRequestHandler):
                     "ok": True, "mode": "repair",
                     "class": verdict["class"], "reasons": verdict.get("reasons"),
                     "hint": verdict.get("hint"), "plan": plan,
-                    "prompt": repair_prompt(proj_root, output),
+                    "prompt": repair_prompt(root, output),
                 })
             if not cfg.get("allow_run"):
                 return self._json(403, {"ok": False, "error": "执行命令未启用，先在设置页勾选「自动执行」"})
@@ -2847,7 +2548,7 @@ class Handler(BaseHTTPRequestHandler):
             if res.get("ok") and cfg.get("auto_open") in ("static", "always"):
                 entry = plan.get("entry")
                 if entry:
-                    res["open"] = open_static(proj_root, entry, inproc=True)
+                    res["open"] = open_target(entry)
             return self._json(200, res)
 
         if path != "/apply":
@@ -2975,8 +2676,8 @@ MIRROR_PREFIXES = (
     "https://ghproxy.net/",
 )
 # update 只碰这些文件，配置 .p2r/ 和用户自己的项目目录一律不碰
-UPDATE_FILES = ("p2r.py", "p2r.user.js", "README.md", "HANDOFF.md",
-                "start.sh", "start.bat", "start.command", "start_silent.vbs", "LICENSE")
+UPDATE_FILES = ("p2r.py", "p2r.user.js", "README.md",
+                "start.sh", "start.bat", "start.command", "LICENSE")
 
 
 def _download(urls, timeout=25):
@@ -3092,75 +2793,6 @@ def cmd_update(check_only=False, tag=None, mirror=False, force=False):
     print("下一步:")
     print("  1. 关掉当前 p2r 窗口，重新运行 start 脚本（服务要重启才用新 p2r.py）")
     print("  2. 打开 http://127.0.0.1:%s/ 按页面提示重装一次油猴脚本" % DEFAULT_PORT)
-    return 0
-
-
-
-
-def cmd_autostart(disable=False):
-    """配置或取消开机静默后台启动（无黑框终端）。"""
-    script = os.path.abspath(__file__)
-    if os.name == "nt":
-        startup = os.path.join(
-            os.environ.get("APPDATA", ""),
-            "Microsoft", "Windows", "Start Menu", "Programs", "Startup"
-        )
-        vbs = os.path.join(startup, "Paste2Run-Silent.vbs")
-        if disable:
-            if os.path.exists(vbs):
-                os.remove(vbs)
-            print("已取消 Windows 开机静默自启")
-            return 0
-        pyw = shutil.which("pythonw") or sys.executable
-        os.makedirs(startup, exist_ok=True)
-        content = 'CreateObject("WScript.Shell").Run """%s"" ""%s"" serve", 0, False\n' % (pyw, script)
-        with open(vbs, "w", encoding="utf-8") as fh:
-            fh.write(content)
-        print("已写入 Windows 开机静默自启: %s" % vbs)
-        return 0
-    if sys.platform == "darwin":
-        plist = os.path.expanduser("~/Library/LaunchAgents/local.p2r.plist")
-        if disable:
-            subprocess.run(["launchctl", "unload", plist], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            if os.path.exists(plist):
-                os.remove(plist)
-            print("已取消 macOS 后台自启")
-            return 0
-        os.makedirs(os.path.dirname(plist), exist_ok=True)
-        xml = (
-            '<?xml version="1.0" encoding="UTF-8"?>\n'
-            '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
-            '<plist version="1.0"><dict>'
-            '<key>Label</key><string>local.p2r</string>'
-            '<key>ProgramArguments</key><array>'
-            '<string>%s</string><string>%s</string><string>serve</string>'
-            '</array>'
-            '<key>RunAtLoad</key><true/>'
-            '<key>KeepAlive</key><true/>'
-            '</dict></plist>\n' % (sys.executable, script)
-        )
-        with open(plist, "w", encoding="utf-8") as fh:
-            fh.write(xml)
-        subprocess.run(["launchctl", "load", plist], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        print("已配置 macOS 后台自启: %s" % plist)
-        return 0
-    unit = os.path.expanduser("~/.config/systemd/user/p2r.service")
-    if disable:
-        subprocess.run(["systemctl", "--user", "disable", "--now", "p2r.service"],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if os.path.exists(unit):
-            os.remove(unit)
-        print("已取消 Linux 后台自启")
-        return 0
-    os.makedirs(os.path.dirname(unit), exist_ok=True)
-    with open(unit, "w", encoding="utf-8") as fh:
-        fh.write(
-            "[Unit]\nDescription=Paste2Run Local Bridge\n\n"
-            "[Service]\nExecStart=%s %s serve\nRestart=on-failure\n\n"
-            "[Install]\nWantedBy=default.target\n" % (sys.executable, script)
-        )
-    print("已生成 systemd 用户服务: %s" % unit)
-    print("如需立即启用: systemctl --user enable --now p2r.service")
     return 0
 
 
@@ -3290,13 +2922,13 @@ npm install && npm run dev
 
         # 项目隔离：文件重合度高算同一项目，全不同就新开目录
         with tempfile.TemporaryDirectory() as pbase:
-            r1 = apply_text("===FILE: index.html===\nA\n===FILE: app.js===\nB\n", pbase, project_mode="auto")
+            r1 = apply_text("===FILE: index.html===\nA\n===FILE: app.js===\nB\n", pbase)
             assert os.path.abspath(r1["target"]) == os.path.abspath(pbase), r1["target"]
-            r2 = apply_text("===FILE: index.html===\nA2\n===FILE: app.js===\nB2\n", pbase, project_mode="auto")
+            r2 = apply_text("===FILE: index.html===\nA2\n===FILE: app.js===\nB2\n", pbase)
             assert os.path.abspath(r2["target"]) == os.path.abspath(pbase), r2["target"]
-            r3 = apply_text("===FILE: other.html===\nX\n===FILE: main.py===\nY\n", pbase, project_mode="auto")
+            r3 = apply_text("===FILE: other.html===\nX\n===FILE: main.py===\nY\n", pbase)
             assert os.path.abspath(r3["target"]) != os.path.abspath(pbase), r3["target"]
-            r4 = apply_text("===PROJECT: tagged===\n===FILE: z.txt===\n1\n", pbase, project_mode="auto")
+            r4 = apply_text("===PROJECT: tagged===\n===FILE: z.txt===\n1\n", pbase)
             assert os.path.basename(r4["target"]) == "tagged", r4["target"]
 
         # update 的版本解析
@@ -3304,28 +2936,7 @@ npm install && npm run dev
         assert _ver_tuple("0.4.4") > _ver_tuple("0.4.3")
         assert _ver_tuple("unknown") == ()
 
-    # v0.5.0: P2R-READY 剥离 + 轻量 Agent TOOL 解析与执行
-    gate_mix = "===FILE: app.js===\nconsole.log(1);\n===RUN===\necho hi\nP2R-READY\n"
-    gf, gr = parse(gate_mix)
-    assert gf[0][1].strip() == "console.log(1);" and gr == "echo hi", (gf, gr)
-    t_sample = "先看下文件：\n===TOOL: tree===\n===TOOL: read_file===\nindex.html\n===TOOL: search===\nhi\nP2R-READY\n"
-    ts = parse_tools(t_sample)
-    assert [n for n, _ in ts] == ["tree", "read_file", "search"], ts
-    with tempfile.TemporaryDirectory() as tmp4:
-        with open(os.path.join(tmp4, "index.html"), "w", encoding="utf-8") as fh:
-            fh.write("<h1>hi agent</h1>\n")
-        tr = execute_tools(tmp4, ts)
-        assert tr["ok"] and len(tr["results"]) == 3 and "hi agent" in tr["reply"], tr
-
-    # v0.5.1: 切换空白新项目不再残留旧项目树
-    with tempfile.TemporaryDirectory() as tmp5:
-        apply_text("===PROJECT: oldapp===\n===FILE: old.js===\n1\n", tmp5, project_mode="auto")
-        assert "old.js" in project_tree(resolve_root(tmp5))
-        nr = reset_active_project(tmp5, "fresh-app")
-        assert nr["ok"] and resolve_root(tmp5) == nr["target"]
-        assert project_tree(resolve_root(tmp5)) == ""
-
-    print("selftest ok: 解析 / P2R-READY剥离 / 轻量Agent工具 / 新项目隔离重置 / 围栏与尾随结语 / 乱序RUN / 越界与.git拦截 / IPv6 Host /"
+    print("selftest ok: 解析 / 围栏与尾随结语 / 乱序RUN / 加粗标记 / 越界与.git拦截 / IPv6 Host /"
           " 覆写备份(last不膨胀) / 报错归因 / 项目探测 / 项目隔离 全部通过")
 
 
@@ -3346,8 +2957,6 @@ def main():
     a.add_argument("--dry-run", action="store_true")
 
     sub.add_parser("doctor", help="环境自检")
-    au = sub.add_parser("autostart", help="配置或取消开机无黑窗后台自启")
-    au.add_argument("--off", action="store_true", help="取消开机自启")
     sub.add_parser("selftest", help="解析自检")
 
     up = sub.add_parser("update", help="从 GitHub 拉最新版覆盖自己")
@@ -3371,8 +2980,6 @@ def main():
         cmd_apply(args.file, args.dir, args.dry_run)
     elif cmd == "doctor":
         sys.exit(cmd_doctor())
-    elif cmd == "autostart":
-        sys.exit(cmd_autostart(disable=args.off))
     elif cmd == "update":
         sys.exit(cmd_update(check_only=args.check, tag=args.tag,
                             mirror=bool(args.mirror), force=args.force))
